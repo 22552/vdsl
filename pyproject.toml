@@ -1,0 +1,12 @@
+[project]
+name = "vdls"
+version = "0.1.0"
+description = "Reference core implementation for VDLS Draft 1.0"
+requires-python = ">=3.11"
+dependencies = ["Pillow>=10", "regex>=2024.5"]
+
+[project.scripts]
+vdls = "vdls:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
