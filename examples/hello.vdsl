@@ -1,0 +1,42 @@
+#lang vdls
+
+(project
+  (id "hello")
+
+  (output
+    (id main)
+    (file "dist/hello.mp4")
+    (container mp4)
+    (video
+      (codec h264)
+      (size 1280 720)
+      (fps 30)
+      (pixel-format yuv420p)
+      (color-space bt709))
+    (audio
+      (codec aac)
+      (sample-rate 48000)
+      (channels stereo)))
+
+  (asset background
+    (generated
+      (solid-color "#10141fff")
+      (duration 5s)))
+
+  (scene intro
+    (start 0s)
+    (duration 5s)
+
+    (layer 0
+      (video
+        (asset-ref background)))
+
+    (layer 10
+      (text "Hello, VDLS"
+        (position 640px 360px)
+        (anchor center)
+        (font
+          (family "Noto Sans")
+          (size 72px)
+          (weight 700))
+        (fill "#ffffffff")))))
