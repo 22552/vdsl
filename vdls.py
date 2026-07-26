@@ -5,7 +5,7 @@ emits inspectable artifacts; rendering is only attempted when ffmpeg is found.
 """
 from __future__ import annotations
 
-import argparse, hashlib, json, math, os, re, shutil, signal, subprocess
+import argparse, copy, hashlib, json, math, os, re, shutil, signal, subprocess
 import struct, sys, time, tomllib
 from dataclasses import dataclass
 from fractions import Fraction
@@ -21,18 +21,20 @@ from vdls_ffmpeg_backend import (
 )
 from vdls_process import ProcessInterrupted, ProcessTimedOut, run_external
 from vdls_media_metadata import exif_manifest_summary, read_exif
-from vdls_subtitles import serialize_sidecar
+from vdls_subtitles import serialize_sidecar, serialize_karaoke_ass
 from vdls_ffmpeg_filters import (
     compile_audio_effects as lower_audio_effects,
     compile_extended_visual_effect, ffmpeg_blend_mode,
 )
+from vdls_lisp import expand_lisp
 
 VERSION = "0.1.0"
 UNITS = {
     "s", "ms", "us", "ns", "f", "px", "%", "pct", "deg", "rad", "turn",
     "dB", "db", "Hz", "hz", "kHz", "khz", "lufs", "LUFS",
 }
-TOKEN = re.compile(r'\s*(?:;[^\n]*|("(?:\\.|[^"\\])*")|([()]|[^\s()]+))')
+TOKEN = re.compile(
+    r'\s*(?:;[^\n]*|("(?:\\.|[^"\\])*")|([()\[\]]|[^\s()\[\]]+))')
 NUMBER = re.compile(
     r"^([+-]?(?:\d+(?:\.\d+)?|\d+/\d+))"
     r"(s|ms|us|ns|f|px|%|pct|deg|rad|turn|dB|db|Hz|hz|kHz|khz|lufs|LUFS)$"
@@ -43,6 +45,7 @@ PURE_OPERATORS = {
     "=","!=","<","<=",">",">=","and","or","not","sin","cos","tan",
     "asin","acos","atan","exp","log","sqrt","pow","mix","smoothstep",
     "step","mod","vec2","vec3","vec4","component","if","tr",
+    "random","random2","random3","random4",
 }
 EXPRESSION_VARIABLES = {
     "t","T","u","frame","fps","width","height","input-width","input-height",
@@ -109,12 +112,15 @@ def parse(text: str) -> list[Any]:
         nonlocal i
         if i >= len(tokens): raise Diagnostic("VDLS-READ-005", "unmatched opening delimiter")
         atom, off=tokens[i]; i+=1
-        if atom == "(":
+        if atom in {"(","["}:
+            closing=")" if atom=="(" else "]"
             items=[]
-            while i < len(tokens) and tokens[i][0] != ")": items.append(form())
+            while i < len(tokens) and tokens[i][0] != closing:
+                items.append(form())
             if i == len(tokens): raise Diagnostic("VDLS-READ-005", "unmatched opening delimiter", off)
             i+=1; return items
-        if atom == ")": raise Diagnostic("VDLS-READ-005", "unmatched closing delimiter", off)
+        if atom in {")","]"}:
+            raise Diagnostic("VDLS-READ-005", "unmatched closing delimiter", off)
         if atom.startswith('"'):
             try: return json.loads(atom)
             except json.JSONDecodeError: raise Diagnostic("VDLS-READ-002", "invalid string literal", off)
@@ -190,6 +196,55 @@ def normalize_expression(value: Any, variables: set[str] | None=None) -> dict[st
                          f"`{operator}` received {len(arguments)} operands")
     return {"kind":"Call","operator":operator,"arguments":arguments}
 
+def normalize_easing(value: Any) -> str | dict[str,Any]:
+    """Normalize named and parameterized standard-library easing values."""
+    named={
+        "linear","smoothstep","ease-in-quad","ease-out-quad",
+        "ease-in-out-quad","ease-in-cubic","ease-out-cubic",
+        "ease-in-out-cubic",
+    }
+    if isinstance(value,str):
+        if value not in named:
+            raise Diagnostic("VDLS-NAME-010",f"easing `{value}` does not resolve")
+        return value
+    if not isinstance(value,list) or not value:
+        raise Diagnostic("VDLS-PARSE-003","invalid easing")
+    kind=str(value[0])
+    if kind=="cubic-bezier":
+        if len(value)!=5:
+            raise Diagnostic("VDLS-PARSE-003","cubic-bezier requires four values")
+        try: values=[Fraction(str(item)) for item in value[1:]]
+        except (ValueError,ZeroDivisionError):
+            raise Diagnostic("VDLS-TYPE-004","cubic-bezier values must be numbers")
+        if not 0<=values[0]<=1 or not 0<=values[2]<=1:
+            raise Diagnostic("VDLS-TYPE-009","cubic-bezier x1 and x2 must be within [0,1]")
+        return {
+            "kind":"CubicBezier",
+            "x1":str(values[0]),"y1":str(values[1]),
+            "x2":str(values[2]),"y2":str(values[3]),
+        }
+    if kind=="spring":
+        defaults={"mass":Fraction(1),"stiffness":Fraction(170),
+                  "damping":Fraction(26),"initialVelocity":Fraction(0)}
+        names={"mass":"mass","stiffness":"stiffness","damping":"damping",
+               "initial-velocity":"initialVelocity"}
+        seen=set()
+        for clause in value[1:]:
+            if (not isinstance(clause,list) or len(clause)!=2
+                    or str(clause[0]) not in names):
+                raise Diagnostic("VDLS-PARSE-003","invalid spring parameter")
+            key=names[str(clause[0])]
+            if key in seen:
+                raise Diagnostic("VDLS-PARSE-004",f"duplicate spring parameter `{clause[0]}`")
+            seen.add(key)
+            try: defaults[key]=Fraction(str(clause[1]))
+            except (ValueError,ZeroDivisionError):
+                raise Diagnostic("VDLS-TYPE-004","spring parameters must be numbers")
+        if defaults["mass"]<=0 or defaults["stiffness"]<=0 or defaults["damping"]<0:
+            raise Diagnostic("VDLS-TYPE-009","spring mass/stiffness must be positive and damping non-negative")
+        return {"kind":"Spring",**{key:str(value) for key,value in defaults.items()}}
+    raise Diagnostic("VDLS-NAME-010",f"easing `{kind}` does not resolve")
+
 def normalize_animation(form: list[Any]) -> dict[str,Any]:
     if len(form)<3 or form[0]!="animate" or not isinstance(form[1],str):
         raise Diagnostic("VDLS-PARSE-003","animate requires a property and body")
@@ -208,11 +263,11 @@ def normalize_animation(form: list[Any]) -> dict[str,Any]:
                 raise Diagnostic("VDLS-TIME-004","duplicate keyframe time")
             if previous is not None and exact<previous:
                 raise Diagnostic("VDLS-TIME-005","keyframes are not ordered")
-            easing="linear"
+            easing: str | dict[str,Any]="linear"
             easing_clause=next((clause for clause in item[2:]
                                 if isinstance(clause,list) and len(clause)==2
                                 and clause[0]=="easing"),None)
-            if easing_clause: easing=str(easing_clause[1])
+            if easing_clause: easing=normalize_easing(easing_clause[1])
             frames.append({"time":timestamp,"value":item[1],"easing":easing})
             previous=exact
         if not frames: raise Diagnostic("VDLS-PARSE-003","keyframes requires entries")
@@ -233,14 +288,7 @@ def normalize_animation(form: list[Any]) -> dict[str,Any]:
         raise Diagnostic("VDLS-TYPE-004","animation duration requires time")
     if duration_value["num"]<0:
         raise Diagnostic("VDLS-TIME-001","negative animation duration")
-    easing=str(clauses.get("easing",["linear"])[0])
-    allowed={
-        "linear","smoothstep","ease-in-quad","ease-out-quad",
-        "ease-in-out-quad","ease-in-cubic","ease-out-cubic",
-        "ease-in-out-cubic",
-    }
-    if easing not in allowed:
-        raise Diagnostic("VDLS-NAME-010",f"easing `{easing}` does not resolve")
+    easing=normalize_easing(clauses.get("easing",["linear"])[0])
     return {"kind":"FromTo","property":property_path,
             "from":clauses["from"][0],"to":clauses["to"][0],
             "duration":duration_value,"easing":easing}
@@ -376,9 +424,36 @@ def resolve_imports(forms: list[Any], source: Path,
     source=source.resolve()
     if source in stack:
         chain=" -> ".join(item.name for item in (*stack,source))
-        raise Diagnostic("VDLS-NAME-005",f"cyclic module import: {chain}")
+        raise Diagnostic("VDLS-LISP-051",f"cyclic module import: {chain}")
     output=[]; imports=[]
     for form in forms:
+        if (isinstance(form,list) and form and form[0]=="include"):
+            if len(form)!=2 or not isinstance(form[1],str):
+                raise Diagnostic(
+                    "VDLS-PARSE-003","include requires a source path")
+            include_path=(source.parent/form[1]).resolve()
+            try: include_path.relative_to(project_root)
+            except ValueError:
+                raise Diagnostic(
+                    "VDLS-LISP-052",
+                    f"include escapes project root: {form[1]}")
+            if not include_path.exists():
+                raise Diagnostic(
+                    "VDLS-CONFIG-001",f"include not found: {form[1]}")
+            include_text=include_path.read_text(encoding="utf-8")
+            include_text=re.sub(
+                r"^\s*#lang\s+vdls[^\n]*(?:\n|$)","",
+                include_text.lstrip("\ufeff"),count=1)
+            included,children=resolve_imports(
+                parse(include_text),include_path,project_root,(*stack,source))
+            output.extend(included); imports.extend(children)
+            imports.append({
+                "module":str(form[1]),"path":str(include_path),
+                "standard":False,"include":True,
+                "digest":"sha256:"+hashlib.sha256(
+                    include_path.read_bytes()).hexdigest(),
+            })
+            continue
         if not (isinstance(form,list) and form and form[0]=="import"):
             output.append(form); continue
         if len(form)<2 or not isinstance(form[1],str):
@@ -390,7 +465,7 @@ def resolve_imports(forms: list[Any], source: Path,
         module_path=(source.parent/module).resolve()
         try: module_path.relative_to(project_root)
         except ValueError:
-            raise Diagnostic("VDLS-SECURITY-010",
+            raise Diagnostic("VDLS-LISP-052",
                              f"module import escapes project root: {module}")
         if not module_path.exists():
             raise Diagnostic("VDLS-CONFIG-001",f"module not found: {module}")
@@ -406,8 +481,89 @@ def resolve_imports(forms: list[Any], source: Path,
                              "imported module must not contain a project")
         expanded,children=resolve_imports(
             module_forms,module_path,project_root,(*stack,source))
-        output.extend(expanded); imports.extend(children)
-        imports.append({"module":module,"path":str(module_path),"standard":False})
+        module_wrappers=[
+            item for item in expanded
+            if isinstance(item,list) and item and item[0]=="module"]
+        if module_wrappers:
+            if len(module_wrappers)!=1 or len(expanded)!=1:
+                raise Diagnostic(
+                    "VDLS-LISP-050",
+                    "module file must contain one module form")
+            wrapper=module_wrappers[0]
+            if len(wrapper)<2:
+                raise Diagnostic("VDLS-LISP-050","malformed module")
+            body=wrapper[2:]
+            export_clause=next((
+                item for item in body
+                if isinstance(item,list) and item
+                and item[0]=="export"),None)
+            exports=(
+                [str(item) for item in export_clause[1:]]
+                if export_clause else [])
+            declarations=[
+                item for item in body
+                if isinstance(item,list) and item
+                and item[0] in {
+                    "define","component","define-template","define-easing"}]
+            names=[]
+            for declaration in declarations:
+                signature=declaration[1] if len(declaration)>1 else None
+                names.append(str(signature[0])
+                             if isinstance(signature,list) and signature
+                             else str(signature))
+            if len(names)!=len(set(names)):
+                raise Diagnostic(
+                    "VDLS-LISP-050","duplicate module declaration")
+            missing=sorted(set(exports)-set(names))
+            if missing:
+                raise Diagnostic(
+                    "VDLS-LISP-053",
+                    f"module exports unknown identifier `{missing[0]}`")
+            options={
+                str(item[0]):item[1:] for item in form[2:]
+                if isinstance(item,list) and item}
+            alias=(str(options["as"][0]) if options.get("as") else None)
+            selected=(
+                {str(item) for item in options.get("only",exports)}
+                if options.get("only") else set(exports))
+            unknown_selected=sorted(selected-set(exports))
+            if unknown_selected:
+                raise Diagnostic(
+                    "VDLS-LISP-053",
+                    f"non-exported identifier `{unknown_selected[0]}`")
+            rename_entries=options.get("rename",[])
+            rename_map={}
+            for entry in rename_entries:
+                if not isinstance(entry,list) or len(entry)!=2:
+                    raise Diagnostic(
+                        "VDLS-LISP-050","malformed import rename")
+                rename_map[str(entry[0])]=str(entry[1])
+            module_key=hashlib.sha256(
+                str(module_path).encode("utf-8")).hexdigest()[:12]
+            mapping={}
+            for name in names:
+                if name in selected:
+                    public_name=rename_map.get(name,name)
+                    mapping[name]=(
+                        f"{alias}:{public_name}" if alias else public_name)
+                else:
+                    mapping[name]=f"__module_{module_key}:{name}"
+            def rename_tree(value: Any) -> Any:
+                if isinstance(value,Symbol) and str(value) in mapping:
+                    return Symbol(mapping[str(value)])
+                if isinstance(value,list):
+                    return [rename_tree(item) for item in value]
+                return value
+            output.extend(rename_tree(item) for item in declarations)
+        else:
+            # Draft-1.0 legacy modules without `(module ...)` remain flattened.
+            output.extend(expanded)
+        imports.extend(children)
+        imports.append({
+            "module":module,"path":str(module_path),"standard":False,
+            "digest":"sha256:"+hashlib.sha256(
+                module_path.read_bytes()).hexdigest(),
+        })
     return output,imports
 
 def compile_source(text: str, source: Path) -> dict[str, Any]:
@@ -418,8 +574,15 @@ def compile_source(text: str, source: Path) -> dict[str, Any]:
             raise Diagnostic("VDLS-READ-006", "portable source requires `#lang vdls`")
         normalized=normalized[lang_match.end():]
     raw_forms,import_nodes=resolve_imports(parse(normalized),source)
-    forms=expand_templates(raw_forms)
-    allowed_top={"project","requires-vdls","import","define","define-easing"}
+    lisp_forms,lisp_identity=expand_lisp(raw_forms,Symbol,Diagnostic)
+    lisp_identity["modules"]=[
+        {
+            "module":item["module"],"path":item["module"],
+            "digest":item.get("digest"),"include":item.get("include",False),
+        }
+        for item in import_nodes if not item.get("standard")]
+    forms=expand_templates(lisp_forms)
+    allowed_top={"project","requires-vdls","import","define-easing"}
     for form in forms:
         if not isinstance(form,list) or not form or form[0] not in allowed_top:
             name=form[0] if isinstance(form,list) and form else form
@@ -427,7 +590,8 @@ def compile_source(text: str, source: Path) -> dict[str, Any]:
     projects=[x for x in forms if isinstance(x,list) and x and x[0]=="project"]
     if len(projects)!=1: raise Diagnostic("VDLS-PARSE-001", "expected exactly one top-level `project` form")
     p=projects[0]; state={}; assets={}; scenes=[]; outputs=[]; project_id=None
-    settings=None; project_annotations={}
+    timeline_form=None
+    settings=None; project_annotations={"vdls.lispExpansion":lisp_identity}
     color_management={
         "workingSpace":{
             "primaries":"bt709","transfer":"linear",
@@ -690,20 +854,81 @@ def compile_source(text: str, source: Path) -> dict[str, Any]:
                 raise Diagnostic("VDLS-PARSE-003","shape requires a shape kind")
             return {"kind":"Shape","id":node_id("shape",state),"shapeKind":form[1],
                     "geometry":form[2:],**common}
+        if kind in {"stack","grid"}:
+            if kind=="stack":
+                if len(form)<2 or str(form[1]) not in {
+                        "vertical","horizontal"}:
+                    raise Diagnostic(
+                        "VDLS-PARSE-003",
+                        "stack requires vertical or horizontal direction")
+                direction=str(form[1]); option_start=2
+                columns=None
+            else:
+                direction=None; option_start=1
+                columns_clause=by_name.get("columns",[])
+                if (len(columns_clause)!=1
+                        or len(columns_clause[0])!=2
+                        or not str(columns_clause[0][1]).isdigit()
+                        or int(columns_clause[0][1])<1):
+                    raise Diagnostic(
+                        "VDLS-PARSE-003",
+                        "grid requires one positive (columns N) clause")
+                columns=int(columns_clause[0][1])
+            gap_clause=by_name.get("gap",[[None,"0px"]])[0]
+            if len(gap_clause)==2:
+                row_gap=column_gap=ratio(gap_clause[1])
+            elif len(gap_clause)==3:
+                row_gap=ratio(gap_clause[1])
+                column_gap=ratio(gap_clause[2])
+            else:
+                raise Diagnostic(
+                    "VDLS-PARSE-003","layout gap requires one or two lengths")
+            for name,value in (("row",row_gap),("column",column_gap)):
+                if value.get("unit")!="px" or Fraction(
+                        value["num"],value["den"])<0:
+                    raise Diagnostic(
+                        "VDLS-TYPE-004",
+                        f"{name} gap requires a non-negative pixel length")
+            padding_clause=by_name.get("padding",[[None,"0px"]])[0]
+            if len(padding_clause)!=2:
+                raise Diagnostic(
+                    "VDLS-PARSE-003","layout padding requires one length")
+            padding=ratio(padding_clause[1])
+            if padding.get("unit")!="px" or Fraction(
+                    padding["num"],padding["den"])<0:
+                raise Diagnostic(
+                    "VDLS-TYPE-004",
+                    "layout padding requires a non-negative pixel length")
+            children=[
+                compile_node(item,inherited_duration)
+                for item in form[option_start:]
+                if isinstance(item,list) and item and item[0] in
+                {"video","text","shape","group","stack","grid","subtitles"}]
+            if not children:
+                raise Diagnostic(
+                    "VDLS-PARSE-003",f"{kind} requires child nodes")
+            return {
+                "kind":"LayoutGroup","id":node_id(kind,state),
+                "layoutKind":kind,"direction":direction,"columns":columns,
+                "gap":{"row":row_gap,"column":column_gap},
+                "padding":padding,"children":children,**common}
         if kind=="group":
             children=[compile_node(item,inherited_duration) for item in form[1:]
                       if isinstance(item,list) and item and item[0] in
-                      {"video","audio","text","shape","group","subtitles"}]
+                      {"video","audio","text","shape","group","stack","grid",
+                       "subtitles"}]
             if not children:
                 raise Diagnostic("VDLS-PARSE-003","group requires at least one child node")
             return {"kind":"Group","id":node_id("group",state),"children":children,**common}
         if kind=="subtitles":
             refs=[item for item in form[1:] if isinstance(item,list) and item
                   and item[0]=="asset-ref"]
-            if len(refs)!=1 or len(refs[0])!=2:
-                raise Diagnostic("VDLS-PARSE-003","subtitles requires one asset-ref")
-            ref=refs[0][1]
-            if ref not in assets:
+            cue_forms=[item for item in form[1:] if isinstance(item,list) and item
+                       and item[0]=="cue"]
+            if len(refs)>1 or (not refs and not cue_forms):
+                raise Diagnostic("VDLS-PARSE-003","subtitles requires an asset-ref or cue")
+            ref=refs[0][1] if refs else None
+            if ref is not None and ref not in assets:
                 raise Diagnostic("VDLS-NAME-007",
                                  f"asset reference `{ref}` does not resolve")
             language=by_name.get("language",[[None,None]])[0][1]
@@ -726,17 +951,52 @@ def compile_source(text: str, source: Path) -> dict[str, Any]:
                         "VDLS-PARSE-003",
                         "sidecar requires an explicit .srt or .vtt path")
             cues=[]
-            asset_source=assets[ref]["source"]
-            if asset_source["kind"]=="File":
+            asset_source=assets[ref]["source"] if ref is not None else None
+            if asset_source and asset_source["kind"]=="File":
                 subtitle_path=(source.parent/asset_source["path"]).resolve()
                 if subtitle_path.exists() and subtitle_path.suffix.lower() in {".srt",".vtt"}:
                     cues=parse_subtitles(
                         subtitle_path.read_text(encoding="utf-8"),subtitle_path.suffix)
+            for cue_index,cue_form in enumerate(cue_forms,len(cues)+1):
+                if len(cue_form)!=4:
+                    raise Diagnostic("VDLS-PARSE-003","cue requires start, end, and payload")
+                cue_start=ratio(cue_form[1]); cue_end=ratio(cue_form[2])
+                if cue_start.get("unit") or cue_end.get("unit"):
+                    raise Diagnostic("VDLS-TYPE-004","cue bounds require durations")
+                start_q=Fraction(cue_start["num"],cue_start["den"])
+                end_q=Fraction(cue_end["num"],cue_end["den"])
+                if end_q<=start_q:
+                    raise Diagnostic("VDLS-SUB-002","subtitle cue end must be after start")
+                payload=cue_form[3]
+                if isinstance(payload,str):
+                    parsed_payload={"kind":"Text","text":payload}
+                elif isinstance(payload,list) and payload and payload[0]=="karaoke":
+                    segments=[]; previous=start_q
+                    for segment in payload[1:]:
+                        if (not isinstance(segment,list) or len(segment)!=4
+                                or segment[0]!="segment" or not isinstance(segment[3],str)):
+                            raise Diagnostic("VDLS-PARSE-003","invalid karaoke segment")
+                        segment_start=ratio(segment[1]); segment_end=ratio(segment[2])
+                        if segment_start.get("unit") or segment_end.get("unit"):
+                            raise Diagnostic("VDLS-TYPE-004","karaoke times require durations")
+                        left=Fraction(segment_start["num"],segment_start["den"])
+                        right=Fraction(segment_end["num"],segment_end["den"])
+                        if left<start_q or right>end_q or left!=previous or right<=left:
+                            raise Diagnostic("VDLS-SUB-003","karaoke segments must be contiguous within their cue")
+                        segments.append({"start":segment_start,"end":segment_end,"text":segment[3]})
+                        previous=right
+                    if not segments or previous!=end_q:
+                        raise Diagnostic("VDLS-SUB-003","karaoke segments must cover their cue")
+                    parsed_payload={"kind":"Karaoke","segments":segments}
+                else:
+                    raise Diagnostic("VDLS-PARSE-003","unsupported cue payload")
+                cues.append({"id":f"cue:{cue_index}","start":cue_start,"end":cue_end,
+                             "payload":parsed_payload,"region":None,"settings":{},"span":None})
             return {"kind":"Subtitles","id":node_id("subtitles",state),
                     "assetRef":ref,"language":language,"style":style,
                     "burnIn":str(burn_in) in {"true","#t"},
                     "sidecar":sidecar,
-                    "track":{"id":str(ref),"language":language,"kind":"subtitles",
+                    "track":{"id":str(ref or "inline"),"language":language,"kind":"subtitles",
                              "cues":cues,"style":style,"metadata":{},"span":None},
                     **common}
         raise Diagnostic("VDLS-PARSE-002",f"unsupported node `{kind}`")
@@ -912,6 +1172,11 @@ def compile_source(text: str, source: Path) -> dict[str, Any]:
                 color_management["toneMap"]={
                     "operator":operator,"targetNits":str(Fraction(nits))}
             color_management["inherited"]=False
+        elif tag=="timeline":
+            if timeline_form is not None:
+                raise Diagnostic(
+                    "VDLS-PARSE-004","duplicate project timeline")
+            timeline_form=clause
         elif tag=="locale":
             project_annotations.setdefault("vdls.locales",[]).append(clause[1:])
         else:
@@ -928,6 +1193,150 @@ def compile_source(text: str, source: Path) -> dict[str, Any]:
         for scene_ref in output["sceneRefs"]:
             if scene_ref not in known_scenes:
                 raise Diagnostic("VDLS-NAME-008",f"scene reference `{scene_ref}` does not resolve")
+    scene_map={scene["sceneId"]:scene for scene in scenes}
+    timeline_items=[]; timeline_markers=[]; cursor=Fraction(0)
+    timeline_bounded=True
+    if timeline_form is None:
+        for order,scene in enumerate(scenes):
+            scene_duration_value=scene["duration"]
+            scene_duration=(
+                Fraction(
+                    scene_duration_value["num"],scene_duration_value["den"])
+                if scene_duration_value is not None else None)
+            timeline_items.append({
+                "kind":"ScenePlacement",
+                "id":node_id("scene-placement",state),
+                "sceneRef":scene["sceneId"],
+                "start":{
+                    "num":cursor.numerator,"den":cursor.denominator},
+                "duration":scene_duration_value,"sourceOrder":order,
+                "span":None,"annotations":{"legacy":True},
+            })
+            if scene_duration is None:
+                timeline_bounded=False
+            else:
+                cursor+=scene_duration
+        timeline_explicit=False
+    else:
+        timeline_explicit=True
+        for order,item in enumerate(timeline_form[1:]):
+            if not isinstance(item,list) or not item:
+                raise Diagnostic(
+                    "VDLS-PARSE-003","invalid timeline item")
+            item_kind=str(item[0])
+            if item_kind in {"scene","scene-ref"}:
+                if len(item)<2:
+                    raise Diagnostic(
+                        "VDLS-PARSE-003",
+                        "timeline scene placement requires a scene ID")
+                scene_ref=str(item[1])
+                if scene_ref not in scene_map:
+                    raise Diagnostic(
+                        "VDLS-NAME-008",
+                        f"scene reference `{scene_ref}` does not resolve")
+                options=clauses_by_name(item[2:])
+                if options.get("start"):
+                    start_value=duration(options["start"][0])
+                    if start_value is None:
+                        raise Diagnostic(
+                            "VDLS-TYPE-004",
+                            "timeline scene start requires time")
+                    start=Fraction(
+                        start_value["num"],start_value["den"])
+                else:
+                    start=cursor
+                scene_duration_value=scene_map[scene_ref]["duration"]
+                if scene_duration_value is None:
+                    raise Diagnostic(
+                        "VDLS-TIME-004",
+                        f"timeline scene `{scene_ref}` requires finite duration")
+                scene_duration=Fraction(
+                    scene_duration_value["num"],
+                    scene_duration_value["den"])
+                timeline_items.append({
+                    "kind":"ScenePlacement",
+                    "id":node_id("scene-placement",state),
+                    "sceneRef":scene_ref,
+                    "start":{"num":start.numerator,"den":start.denominator},
+                    "duration":scene_duration_value,
+                    "sourceOrder":order,"span":None,"annotations":{},
+                })
+                cursor=max(cursor,start+scene_duration)
+            elif item_kind=="layer":
+                if (len(item)<3 or not isinstance(item[1],str)
+                        or not item[1].lstrip("+-").isdigit()
+                        or not isinstance(item[2],list)):
+                    raise Diagnostic(
+                        "VDLS-PARSE-003",
+                        "timeline layer requires z-index and media node")
+                media=compile_node(item[2],None)
+                timing=clauses_by_name(item[3:])
+                start_value=(
+                    duration(timing["start"][0])
+                    if timing.get("start") else {"num":0,"den":1})
+                duration_value=(
+                    duration(timing["duration"][0])
+                    if timing.get("duration") else media.get("duration"))
+                if start_value is None or duration_value is None:
+                    raise Diagnostic(
+                        "VDLS-TIME-004",
+                        "global timeline layer requires finite duration")
+                start=Fraction(start_value["num"],start_value["den"])
+                item_duration=Fraction(
+                    duration_value["num"],duration_value["den"])
+                layer={
+                    "kind":"Layer","id":node_id("global-layer",state),
+                    "zIndex":int(item[1]),"start":start_value,
+                    "duration":duration_value,"enabled":True,
+                    "blendMode":media["blendMode"],"opacity":media["opacity"],
+                    "content":media,"masks":[],"effects":media["effects"],
+                    "scope":"project","span":None,"annotations":{},
+                }
+                timeline_items.append({
+                    "kind":"GlobalLayer","id":layer["id"],
+                    "layer":layer,"start":start_value,
+                    "duration":duration_value,"sourceOrder":order,
+                    "span":None,"annotations":{},
+                })
+                cursor=max(cursor,start+item_duration)
+            elif item_kind=="marker":
+                if len(item)<2:
+                    raise Diagnostic(
+                        "VDLS-PARSE-003","timeline marker requires an ID")
+                marker_id=str(item[1])
+                options=clauses_by_name(item[2:])
+                at_clause=options.get("at") or options.get("time")
+                if not at_clause:
+                    raise Diagnostic(
+                        "VDLS-PARSE-003","timeline marker requires (at TIME)")
+                at_value=duration(at_clause[0])
+                if at_value is None:
+                    raise Diagnostic(
+                        "VDLS-TYPE-004","timeline marker requires time")
+                marker={
+                    "kind":"TimelineMarker",
+                    "id":node_id("marker",state),"markerId":marker_id,
+                    "time":at_value,
+                    "label":str(options.get("label",[[None,marker_id]])[0][1]),
+                    "metadata":{},"sourceOrder":order,
+                    "span":None,"annotations":{},
+                }
+                timeline_markers.append(marker)
+                cursor=max(cursor,Fraction(at_value["num"],at_value["den"]))
+            else:
+                raise Diagnostic(
+                    "VDLS-PARSE-002",
+                    f"unknown timeline item `{item_kind}`")
+    timeline_duration=({
+        "num":cursor.numerator,"den":cursor.denominator}
+        if timeline_bounded else None)
+    project_timeline={
+        "kind":"ProjectTimeline","id":node_id("timeline",state),
+        "explicit":timeline_explicit,"start":{"num":0,"den":1},
+        "duration":timeline_duration,"items":timeline_items,
+        "markers":timeline_markers,"timeBase":None,
+        "span":None,"annotations":{},
+    }
     if color_management["unknownMetadataPolicy"]=="strict":
         unknown_asset=next((
             asset for asset in assets.values()
@@ -953,6 +1362,7 @@ def compile_source(text: str, source: Path) -> dict[str, Any]:
           "astVersion":"1.0.0","settings":settings,"imports":import_nodes,
           "colorManagement":color_management,
           "assets":list(assets.values()),"templates":[],"scenes":scenes,
+          "timeline":project_timeline,
           "outputs":outputs,"span":None,"annotations":project_annotations}
     return {"astVersion":"1.0.0","node":root}
 
@@ -1023,17 +1433,47 @@ def graph(ast: dict[str,Any]) -> dict[str,Any]:
             add_node(produced,"core/generate-shape",[],[port(output_port,"frame-surface")],
                      {"shapeKind":content["shapeKind"],"geometry":content["geometry"]},time_domain)
         elif content["kind"]=="Subtitles":
-            resolve=f"rg:resolve:{content['id']}"
             produced=f"rg:render-subtitles:{content['id']}"; output_port="surface"
-            add_node(resolve,"core/resolve-asset",[],[port("file","file")],
-                     {"assetId":content["assetRef"],
-                      "source":assets[content["assetRef"]]["source"]})
-            add_node(produced,"core/render-subtitles",[port("file","file")],
+            inputs=[]
+            if content.get("assetRef") is not None:
+                resolve=f"rg:resolve:{content['id']}"
+                add_node(resolve,"core/resolve-asset",[],[port("file","file")],
+                         {"assetId":content["assetRef"],
+                          "source":assets[content["assetRef"]]["source"]})
+                inputs=[port("file","file")]
+            add_node(produced,"core/render-subtitles",inputs,
                      [port(output_port,"frame-surface")],
                      {"language":content["language"],"style":content["style"],
-                      "track":content["track"]},time_domain)
-            edges.append({"fromNode":resolve,"fromPort":"file",
-                          "toNode":produced,"toPort":"file"})
+                      "track":content["track"],
+                      "inline":content.get("assetRef") is None},time_domain)
+            if content.get("assetRef") is not None:
+                edges.append({"fromNode":resolve,"fromPort":"file",
+                              "toNode":produced,"toPort":"file"})
+        elif content["kind"]=="LayoutGroup":
+            lowered=[
+                lower_visual(child,time_domain)
+                for child in content["children"]
+                if child["kind"]!="Audio"]
+            if not lowered:
+                raise Diagnostic(
+                    "VDLS-GRAPH-005","layout group has no visual producer")
+            produced=f"rg:layout:{content['id']}"; output_port="surface"
+            inputs=[
+                port(f"child{index}","frame-surface")
+                for index in range(len(lowered))]
+            add_node(
+                produced,f"core/layout-{content['layoutKind']}",
+                inputs,[port(output_port,"frame-surface")],{
+                    "direction":content["direction"],
+                    "columns":content["columns"],
+                    "gap":content["gap"],
+                    "padding":content["padding"],
+                    "resolutionStage":"target",
+                },time_domain)
+            for index,(child_node,child_port) in enumerate(lowered):
+                edges.append({
+                    "fromNode":child_node,"fromPort":child_port,
+                    "toNode":produced,"toPort":f"child{index}"})
         elif content["kind"]=="Group":
             lowered=[lower_visual(child,time_domain) for child in content["children"]
                      if child["kind"]!="Audio"]
@@ -1119,11 +1559,114 @@ def graph(ast: dict[str,Any]) -> dict[str,Any]:
                                              "audio":audio_terminal,
                                              "sidecars":sidecar_nodes}
 
+    project_timeline_terminal=None
+    project_timeline=ast["node"].get("timeline")
+    if project_timeline and project_timeline.get("explicit"):
+        timeline_node=f"rg:project-timeline:{project_timeline['id']}"
+        timeline_inputs=[]; timeline_edges=[]
+        timeline_sidecars=[]
+        has_visual=False; has_audio=False
+        for index,item in enumerate(project_timeline["items"]):
+            if item["kind"]=="ScenePlacement":
+                terminals=terminal_by_scene[item["sceneRef"]]
+                if terminals.get("visual"):
+                    input_name=f"item{index}-visual"
+                    timeline_inputs.append(
+                        port(input_name,"frame-surface"))
+                    terminal=terminals["visual"]
+                    timeline_edges.append({
+                        "fromNode":terminal[0],"fromPort":terminal[1],
+                        "toNode":timeline_node,"toPort":input_name})
+                    has_visual=True
+                if terminals.get("audio"):
+                    input_name=f"item{index}-audio"
+                    timeline_inputs.append(
+                        port(input_name,"audio-stream"))
+                    terminal=terminals["audio"]
+                    timeline_edges.append({
+                        "fromNode":terminal[0],"fromPort":terminal[1],
+                        "toNode":timeline_node,"toPort":input_name})
+                    has_audio=True
+            elif item["kind"]=="GlobalLayer":
+                layer=item["layer"]; content=layer["content"]
+                time_domain={
+                    "start":item["start"],"duration":item["duration"],
+                    "rate":None,"scope":"project"}
+                if content["kind"]=="Subtitles" and content.get("sidecar"):
+                    export=f"rg:export-subtitles:{content['id']}"
+                    shifted_track=copy.deepcopy(content["track"])
+                    offset=Fraction(
+                        item["start"]["num"],item["start"]["den"])
+                    for cue in shifted_track["cues"]:
+                        for key in ("start","end"):
+                            value=Fraction(
+                                cue[key]["num"],cue[key]["den"])+offset
+                            cue[key]={
+                                "num":value.numerator,
+                                "den":value.denominator}
+                    add_node(
+                        export,"core/export-subtitles",[],
+                        [port("file","file")],{
+                            "track":shifted_track,
+                            "path":content["sidecar"]["path"],
+                            "format":content["sidecar"]["format"],
+                            "scope":"project",
+                        },time_domain)
+                    timeline_sidecars.append(
+                        (export,"file",content["sidecar"]))
+                    if not content.get("burnIn"):
+                        continue
+                if content["kind"]=="Audio":
+                    produced,produced_port=lower_asset(content,"audio")
+                    media_type="audio-stream"; suffix="audio"
+                    has_audio=True
+                else:
+                    produced,produced_port=lower_visual(
+                        content,time_domain)
+                    media_type="frame-surface"; suffix="visual"
+                    has_visual=True
+                input_name=f"item{index}-{suffix}"
+                timeline_inputs.append(port(input_name,media_type))
+                timeline_edges.append({
+                    "fromNode":produced,"fromPort":produced_port,
+                    "toNode":timeline_node,"toPort":input_name})
+        timeline_outputs=[]
+        if has_visual:
+            timeline_outputs.append(port("visual","frame-surface"))
+        if has_audio:
+            timeline_outputs.append(port("audio","audio-stream"))
+        if project_timeline["markers"]:
+            timeline_outputs.append(
+                port("metadata","timeline-metadata"))
+        add_node(
+            timeline_node,"core/project-timeline",
+            timeline_inputs,timeline_outputs,{
+                "start":project_timeline["start"],
+                "duration":project_timeline["duration"],
+                "items":project_timeline["items"],
+                "markers":project_timeline["markers"],
+            },{
+                "start":project_timeline["start"],
+                "duration":project_timeline["duration"],
+                "rate":None,"scope":"project",
+            })
+        edges.extend(timeline_edges)
+        project_timeline_terminal={
+            "visual":(timeline_node,"visual") if has_visual else None,
+            "audio":(timeline_node,"audio") if has_audio else None,
+            "metadata":(
+                (timeline_node,"metadata")
+                if project_timeline["markers"] else None),
+            "sidecars":timeline_sidecars,
+        }
+
     targets=[]
     default_scene=ast["node"]["scenes"][0]["sceneId"] if ast["node"]["scenes"] else None
     for output in ast["node"]["outputs"]:
         chosen=output["sceneRefs"][0] if output["sceneRefs"] else default_scene
-        terminals=terminal_by_scene.get(chosen,{})
+        terminals=(project_timeline_terminal
+                   if project_timeline_terminal is not None
+                   else terminal_by_scene.get(chosen,{}))
         source_terminal=terminals.get("visual")
         audio_terminal=terminals.get("audio")
         encode=f"rg:encode-video:{output['id']}"
@@ -1162,12 +1705,20 @@ def graph(ast: dict[str,Any]) -> dict[str,Any]:
             edges.append({"fromNode":resample,"fromPort":"audio",
                           "toNode":encode_audio,"toPort":"audio"})
             mux_inputs.append(port("audio","file")); encoded_outputs.append((encode_audio,"audio","audio"))
+        timeline_metadata=terminals.get("metadata")
+        if timeline_metadata:
+            mux_inputs.append(port("chapters","timeline-metadata"))
         mux=f"rg:mux:{output['id']}"
         add_node(mux,"core/mux",mux_inputs,[port("file","file")],
                  {"container":output["container"],"targetId":output["outputId"]})
         for encoded_node,encoded_port,mux_port in encoded_outputs:
             edges.append({"fromNode":encoded_node,"fromPort":encoded_port,
                           "toNode":mux,"toPort":mux_port})
+        if timeline_metadata:
+            edges.append({
+                "fromNode":timeline_metadata[0],
+                "fromPort":timeline_metadata[1],
+                "toNode":mux,"toPort":"chapters"})
         add_node(write,"core/write-file",[port("file","file")],[port("file","file")],
                  {"path":output["path"],"targetId":output["outputId"]})
         edges.append({"fromNode":mux,"fromPort":"file","toNode":write,"toPort":"file"})
@@ -1527,9 +2078,17 @@ def generated_video_source(generator: list[Any], width: int, height: int,
     raise Diagnostic("VDLS-BACKEND-003",
                      f"visual generator `{name}` is unsupported")
 
-def frame_random_ffexpr(seed: int=0) -> str:
-    """Stable [0,1) pseudo-random value keyed by output frame and seed."""
-    return f"abs(mod(sin((n+{seed})*12.9898)*43758.5453,1))"
+def frame_random_ffexpr(seed: int=0, node_key: int=0,
+                        stream: int=0, salt: int=0,
+                        component: int=0) -> str:
+    """Traversal-independent [0,1) value keyed as required by spec 011."""
+    key=(seed+node_key*9176+stream*6113+
+         salt*3571+component*1013)
+    return f"abs(mod(sin((n+{key})*12.9898)*43758.5453,1))"
+
+def _random_node_key(node_id_: str) -> int:
+    return int.from_bytes(
+        hashlib.sha256(node_id_.encode("utf-8")).digest()[:4],"big")
 
 def compile_ffexpr(value: Any, variables: dict[str,str] | None=None) -> str:
     """Compile a portable VDLS expression into FFmpeg expression syntax."""
@@ -1543,6 +2102,57 @@ def compile_ffexpr(value: Any, variables: dict[str,str] | None=None) -> str:
     if not isinstance(value,list) or not value:
         raise Diagnostic("VDLS-FFMPEG-005","invalid FFmpeg expression")
     op=str(value[0]); args=value[1:]
+    if op in {"random","random2","random3","random4"}:
+        if len(args) not in {1,2}:
+            raise Diagnostic(
+                "VDLS-LISP-060",f"{op} requires stream and optional salt")
+        try:
+            stream=int(str(args[0]))
+            salt=int(str(args[1])) if len(args)==2 else 0
+        except ValueError:
+            raise Diagnostic(
+                "VDLS-LISP-060","random stream and salt must be integers")
+        seed=int((variables or {}).get("__random_seed","0"))
+        node_key=int((variables or {}).get("__random_node","0"))
+        count={"random":1,"random2":2,"random3":3,"random4":4}[op]
+        values=[
+            frame_random_ffexpr(
+                seed,node_key,stream,salt,component)
+            for component in range(count)]
+        if count!=1:
+            raise Diagnostic(
+                "VDLS-FFMPEG-005",
+                f"{op} vector requires `(component ({op} ...) INDEX)`")
+        return values[0]
+    if op=="component" and len(args)==2 and isinstance(args[0],list):
+        random_form=args[0]
+        random_op=str(random_form[0]) if random_form else ""
+        if random_op in {"random2","random3","random4"}:
+            try: component=int(str(args[1]))
+            except ValueError:
+                raise Diagnostic(
+                    "VDLS-LISP-060","random vector index must be an integer")
+            count={"random2":2,"random3":3,"random4":4}[random_op]
+            if not 0<=component<count:
+                raise Diagnostic(
+                    "VDLS-LISP-060","random vector index is out of range")
+            random_args=random_form[1:]
+            if len(random_args) not in {1,2}:
+                raise Diagnostic(
+                    "VDLS-LISP-060",
+                    f"{random_op} requires stream and optional salt")
+            try:
+                stream=int(str(random_args[0]))
+                salt=(int(str(random_args[1]))
+                      if len(random_args)==2 else 0)
+            except ValueError:
+                raise Diagnostic(
+                    "VDLS-LISP-060",
+                    "random stream and salt must be integers")
+            seed=int((variables or {}).get("__random_seed","0"))
+            node_key=int((variables or {}).get("__random_node","0"))
+            return frame_random_ffexpr(
+                seed,node_key,stream,salt,component)
     compiled=[compile_ffexpr(item,variables) for item in args]
     if op in {"+","*"} and compiled:
         return "("+op.join(compiled)+")"
@@ -1657,6 +2267,27 @@ def compile_visual_effects(
 
 def compile_audio_effects(effects: list[Any]) -> list[str]:
     return lower_audio_effects(effects,Diagnostic,_unit_scalar,ratio)
+
+def linear_light_lut(*, encode: bool) -> str:
+    """Return an RGBA-preserving sRGB transfer conversion for FFmpeg.
+
+    ``blend`` operates on channel samples, rather than on colour-managed
+    values.  VDLS keeps layer surfaces straight-alpha at its public boundary,
+    but performs blend-mode math between a decode/encode pair so modes such as
+    screen and multiply have linear-light semantics.  The backslashes are
+    filtergraph escapes for the commas in FFmpeg expressions.
+    """
+    if encode:
+        expression=(
+            "if(lt(val\\,0.0031308*255)\\,val*12.92\\,"
+            "(1.055*pow(val/255\\,1/2.4)-0.055)*255)")
+    else:
+        expression=(
+            "if(lt(val\\,0.04045*255)\\,val/12.92\\,"
+            "pow((val/255+0.055)/1.055\\,2.4)*255)")
+    return (
+        "format=rgba,"
+        f"lutrgb=r='{expression}':g='{expression}':b='{expression}'")
 
 def emit_video_filter_chain(
     input_label: str, chain: list[str], filters: list[str],
@@ -1823,7 +2454,53 @@ def output_color_ffmpeg_names(color_management: dict[str,Any]) -> dict[str,str]:
     return {key:maps[key].get(value,"unknown")
             for key,value in output.items() if key in maps}
 
-def _easing_ffexpr(name: str, value: str) -> str:
+def _cubic_bezier_ffexpr(descriptor: dict[str,Any], value: str) -> str:
+    """Numerically invert x(u) at compile time and lower a bounded LUT."""
+    x1,y1,x2,y2=(
+        Fraction(descriptor["x1"]),Fraction(descriptor["y1"]),
+        Fraction(descriptor["x2"]),Fraction(descriptor["y2"]))
+    def curve(u: Fraction, first: Fraction, second: Fraction) -> Fraction:
+        inverse=1-u
+        return (3*inverse*inverse*u*first+3*inverse*u*u*second+u*u*u)
+    # Each sample solves x(u)=target with fixed bisection iterations. This is
+    # the specified x-coordinate inversion, not direct y-over-time sampling.
+    samples=[]
+    for index in range(65):
+        target=Fraction(index,64); low=Fraction(0); high=Fraction(1)
+        for _ in range(28):
+            middle=(low+high)/2
+            if curve(middle,x1,x2)<target: low=middle
+            else: high=middle
+        samples.append(curve((low+high)/2,y1,y2))
+    expression=str(samples[-1])
+    for index in range(63,-1,-1):
+        left=Fraction(index,64); right=Fraction(index+1,64)
+        start=samples[index]; end=samples[index+1]
+        interpolated=(f"({start}+(({value})-{left})/({right-left})*"
+                      f"({end-start}))")
+        expression=f"if(lt({value},{right}),{interpolated},{expression})"
+    return expression
+
+def _spring_ffexpr(descriptor: dict[str,Any], value: str) -> str:
+    mass=descriptor["mass"]; stiffness=descriptor["stiffness"]
+    damping=descriptor["damping"]; velocity=descriptor["initialVelocity"]
+    omega=f"sqrt(({stiffness})/({mass}))"
+    zeta=f"(({damping})/(2*sqrt(({stiffness})*({mass}))))"
+    # This is the closed-form damped response.  Clamping the discriminant
+    # keeps critically/over-damped systems defined in FFmpeg's scalar VM;
+    # the under-damped region retains the required overshoot behaviour.
+    damped=f"sqrt(max(0,1-({zeta})*({zeta})))"
+    frequency=f"(({omega})*({damped}))"
+    coefficient=f"((({zeta})*({omega})-({velocity}))/max(0.000001,{frequency}))"
+    return (f"(1-exp(-({zeta})*({omega})*({value}))*"
+            f"(cos(({frequency})*({value}))+({coefficient})*"
+            f"sin(({frequency})*({value}))))")
+
+def _easing_ffexpr(name: str | dict[str,Any], value: str) -> str:
+    if isinstance(name,dict):
+        if name["kind"]=="CubicBezier": return _cubic_bezier_ffexpr(name,value)
+        if name["kind"]=="Spring": return _spring_ffexpr(name,value)
+        raise Diagnostic("VDLS-FFMPEG-005","unknown easing descriptor")
     if name=="linear": return value
     if name=="smoothstep": return f"({value}*{value}*(3-2*{value}))"
     if name=="ease-in-quad": return f"({value}*{value})"
@@ -1865,6 +2542,238 @@ def compile_animation_ffexpr(animation: dict[str,Any],
     first_value=_unit_scalar(frames[0]["value"],variables=variables)
     return f"if(lt(t,{first_time}),{first_value},{expression})"
 
+def output_timeline_scene(
+    ast: dict[str,Any], output: dict[str,Any]
+) -> tuple[dict[str,Any],bool]:
+    scenes={scene["sceneId"]:scene for scene in ast["node"]["scenes"]}
+    timeline=ast["node"].get("timeline")
+    if not timeline or not timeline.get("explicit"):
+        chosen=(output["sceneRefs"][0] if output["sceneRefs"] else
+                (next(iter(scenes)) if scenes else None))
+        if chosen is None:
+            raise Diagnostic("VDLS-GRAPH-005","output has no scene")
+        return scenes[chosen],False
+    if timeline.get("duration") is None:
+        raise Diagnostic(
+            "VDLS-TIME-004","project timeline duration is unbounded")
+    flattened=[]
+    def shift_subtitle_cues(layer: dict[str,Any], offset: Fraction) -> None:
+        content=layer["content"]
+        if content["kind"]!="Subtitles" or not content.get("track"):
+            return
+        for cue in content["track"]["cues"]:
+            for key in ("start","end"):
+                value=Fraction(cue[key]["num"],cue[key]["den"])+offset
+                cue[key]={
+                    "num":value.numerator,"den":value.denominator}
+    for item in timeline["items"]:
+        if item["kind"]=="ScenePlacement":
+            scene=scenes[item["sceneRef"]]
+            placement=Fraction(item["start"]["num"],item["start"]["den"])
+            for local_order,layer in enumerate(scene["layers"]):
+                value=copy.deepcopy(layer)
+                local_start=Fraction(
+                    layer["start"]["num"],layer["start"]["den"])
+                global_start=placement+local_start
+                value["start"]={
+                    "num":global_start.numerator,
+                    "den":global_start.denominator}
+                value.setdefault("annotations",{})[
+                    "timeline.sceneRef"]=item["sceneRef"]
+                value["annotations"]["timeline.placementId"]=item["id"]
+                shift_subtitle_cues(value,global_start)
+                value["_timelineOrder"]=(
+                    item["sourceOrder"],local_order)
+                flattened.append(value)
+        elif item["kind"]=="GlobalLayer":
+            value=copy.deepcopy(item["layer"])
+            global_start=Fraction(
+                value["start"]["num"],value["start"]["den"])
+            shift_subtitle_cues(value,global_start)
+            value["_timelineOrder"]=(item["sourceOrder"],0)
+            flattened.append(value)
+    flattened.sort(
+        key=lambda layer:(
+            layer["zIndex"],layer["_timelineOrder"][0],
+            layer["_timelineOrder"][1]))
+    for layer in flattened: layer.pop("_timelineOrder",None)
+    return {
+        "kind":"Scene","id":timeline["id"],
+        "sceneId":"@project-timeline",
+        "start":{"num":0,"den":1},
+        "duration":timeline["duration"],
+        "background":None,"layers":flattened,
+        "markers":copy.deepcopy(timeline["markers"]),
+        "metadata":{"timelineExplicit":True},
+        "span":None,"annotations":{},
+    },True
+
+def _ffmetadata_escape(value: str) -> str:
+    return (value.replace("\\","\\\\").replace("\n","\\\n")
+            .replace("=","\\=").replace(";","\\;").replace("#","\\#"))
+
+def serialize_timeline_chapters(
+    markers: list[dict[str,Any]], duration: dict[str,int]
+) -> str | None:
+    if not markers:
+        return None
+    timeline_end=Fraction(duration["num"],duration["den"])
+    ordered=sorted(
+        markers,
+        key=lambda marker:Fraction(
+            marker["time"]["num"],marker["time"]["den"]))
+    lines=[";FFMETADATA1"]
+    for index,marker in enumerate(ordered):
+        start=Fraction(marker["time"]["num"],marker["time"]["den"])
+        end=(Fraction(ordered[index+1]["time"]["num"],
+                      ordered[index+1]["time"]["den"])
+             if index+1<len(ordered) else timeline_end)
+        if start<0 or start>=timeline_end:
+            raise Diagnostic(
+                "VDLS-TIME-004",
+                f"timeline marker `{marker['markerId']}` is outside the project")
+        if end<=start:
+            raise Diagnostic(
+                "VDLS-TIME-004",
+                f"timeline marker `{marker['markerId']}` has no chapter span")
+        lines.extend([
+            "[CHAPTER]","TIMEBASE=1/1000000",
+            f"START={round(start*1000000)}",
+            f"END={round(end*1000000)}",
+            f"title={_ffmetadata_escape(str(marker.get('label') or marker['markerId']))}",
+        ])
+    return "\n".join(lines)+"\n"
+
+def resolve_layout_layers(
+    layers: list[dict[str,Any]], width: int, height: int
+) -> list[dict[str,Any]]:
+    """Resolve canonical layout groups into explicitly positioned layers."""
+    def pixels(value: dict[str,Any]) -> Fraction:
+        if value.get("unit")!="px":
+            raise Diagnostic(
+                "VDLS-TYPE-004","layout dimensions require pixel lengths")
+        return Fraction(value["num"],value["den"])
+
+    def token(value: Fraction) -> str:
+        return f"{_decimal_text(value)}px"
+
+    def positioned(
+        content: dict[str,Any], rect: tuple[Fraction,Fraction,Fraction,Fraction]
+    ) -> list[dict[str,Any]]:
+        x,y,cell_width,cell_height=rect
+        value=copy.deepcopy(content)
+        value.setdefault("annotations",{})["vdls.layoutRect"]={
+            "x":{"num":x.numerator,"den":x.denominator},
+            "y":{"num":y.numerator,"den":y.denominator},
+            "width":{"num":cell_width.numerator,"den":cell_width.denominator},
+            "height":{"num":cell_height.numerator,"den":cell_height.denominator},
+        }
+        if value["kind"]=="LayoutGroup":
+            return resolve_group(value,rect)
+        if value["kind"]=="Group":
+            result=[]
+            for child in value["children"]:
+                result.extend(positioned(child,rect))
+            return result
+        if value["kind"]=="Text":
+            value.setdefault("layout",{})["position"]=[token(x),token(y)]
+            value["layout"]["anchor"]=["top-left"]
+            value["layout"]["box"]=[
+                ["width",token(cell_width)],
+                ["height",token(cell_height)],
+                ["wrap","word"],
+                ["overflow","clip"],
+            ]
+        elif value["kind"]=="Video":
+            value.setdefault("effects",[]).insert(
+                0,["scale",token(cell_width),token(cell_height)])
+            transform=value.get("transform")
+            entries=(
+                [copy.deepcopy(item) for item in transform[1:]
+                 if isinstance(item,list) and item
+                 and item[0] not in {"position","anchor"}]
+                if transform else [])
+            value["transform"]=[
+                "transform",["position",token(x),token(y)],
+                ["anchor","top-left"],*entries]
+        else:
+            raise Diagnostic(
+                "VDLS-BACKEND-003",
+                f"layout child `{value['kind']}` is not lowerable "
+                "by the reference FFmpeg profile")
+        return [value]
+
+    def resolve_group(
+        group: dict[str,Any],
+        rect: tuple[Fraction,Fraction,Fraction,Fraction],
+    ) -> list[dict[str,Any]]:
+        x,y,container_width,container_height=rect
+        padding=pixels(group["padding"])
+        row_gap=pixels(group["gap"]["row"])
+        column_gap=pixels(group["gap"]["column"])
+        inner_x=x+padding; inner_y=y+padding
+        inner_width=container_width-2*padding
+        inner_height=container_height-2*padding
+        children=group["children"]; count=len(children)
+        if inner_width<=0 or inner_height<=0:
+            raise Diagnostic(
+                "VDLS-TYPE-009","layout padding leaves no drawable area")
+        rectangles=[]
+        if group["layoutKind"]=="stack":
+            if group["direction"]=="vertical":
+                cell_height=(inner_height-row_gap*(count-1))/count
+                if cell_height<=0:
+                    raise Diagnostic(
+                        "VDLS-TYPE-009","stack gaps exceed its height")
+                rectangles=[
+                    (inner_x,inner_y+i*(cell_height+row_gap),
+                     inner_width,cell_height)
+                    for i in range(count)]
+            else:
+                cell_width=(inner_width-column_gap*(count-1))/count
+                if cell_width<=0:
+                    raise Diagnostic(
+                        "VDLS-TYPE-009","stack gaps exceed its width")
+                rectangles=[
+                    (inner_x+i*(cell_width+column_gap),inner_y,
+                     cell_width,inner_height)
+                    for i in range(count)]
+        else:
+            columns=group["columns"]
+            rows=(count+columns-1)//columns
+            cell_width=(inner_width-column_gap*(columns-1))/columns
+            cell_height=(inner_height-row_gap*(rows-1))/rows
+            if cell_width<=0 or cell_height<=0:
+                raise Diagnostic(
+                    "VDLS-TYPE-009","grid gaps exceed its dimensions")
+            rectangles=[
+                (inner_x+(i%columns)*(cell_width+column_gap),
+                 inner_y+(i//columns)*(cell_height+row_gap),
+                 cell_width,cell_height)
+                for i in range(count)]
+        result=[]
+        for child,child_rect in zip(children,rectangles):
+            result.extend(positioned(child,child_rect))
+        return result
+
+    resolved=[]
+    full_rect=(Fraction(0),Fraction(0),Fraction(width),Fraction(height))
+    for layer in layers:
+        if layer["content"]["kind"]!="LayoutGroup":
+            resolved.append(layer); continue
+        children=resolve_group(layer["content"],full_rect)
+        for index,child in enumerate(children):
+            child_layer=copy.deepcopy(layer)
+            child_layer["id"]=f"{layer['id']}:layout:{index}"
+            child_layer["content"]=child
+            child_layer["blendMode"]=child.get(
+                "blendMode",layer["blendMode"])
+            child_layer["opacity"]=child.get("opacity",layer["opacity"])
+            child_layer.setdefault("annotations",{})[
+                "vdls.layoutParent"]=layer["content"]["id"]
+            resolved.append(child_layer)
+    return resolved
+
 def ffmpeg_plans(ast: dict[str,Any], source: Path,
                  output_dir: str | None=None,
                  selected: list[str] | None=None,
@@ -1894,16 +2803,19 @@ def ffmpeg_plans(ast: dict[str,Any], source: Path,
             try: seed=int(seed_clause[1])
             except ValueError:
                 raise Diagnostic("VDLS-CONFIG-004","build seed must be an integer")
-    expression_variables={"r":frame_random_ffexpr(seed)}
+    expression_variables={
+        "r":frame_random_ffexpr(seed),
+        "__random_seed":str(seed),"__random_node":"0"}
     plans=[]
     for output in ast["node"]["outputs"]:
         if selected and output["outputId"] not in selected: continue
-        scene_id=output["sceneRefs"][0] if output["sceneRefs"] else (
-            next(iter(scenes)) if scenes else None)
-        if scene_id is None: raise Diagnostic("VDLS-GRAPH-005","output has no scene")
-        scene=scenes[scene_id]; video=output["video"]; audio=output["audio"]
+        scene,timeline_explicit=output_timeline_scene(ast,output)
+        video=output["video"]; audio=output["audio"]
         duration=_ratio_text(scene["duration"])
         layers=scene["layers"]
+        if video:
+            layers=resolve_layout_layers(
+                layers,video["width"],video["height"])
         argv=[executable,"-hide_banner","-nostdin","-y"]
         if reproducible:
             argv.extend(["-fflags","+bitexact"])
@@ -1977,6 +2889,32 @@ def ffmpeg_plans(ast: dict[str,Any], source: Path,
                 return lowered
             if not visual_layers:
                 raise Diagnostic("VDLS-GRAPH-005","video output has no visual layers")
+            if timeline_explicit:
+                timeline_asset_id="@vdls/timeline-background"
+                assets[timeline_asset_id]={
+                    "assetId":timeline_asset_id,
+                    "source":{
+                        "kind":"Generated",
+                        "generator":[["solid-color","#000000ff"]],
+                    },
+                }
+                timeline_content={
+                    "kind":"Video","id":"n:timeline-background",
+                    "assetRef":timeline_asset_id,
+                    "sourceRange":None,"effects":[],"speed":None,
+                    "opacity":"1","fadeIn":None,"fadeOut":None,
+                    "transform":None,"animations":[],
+                    "blendMode":"normal","duration":scene["duration"],
+                }
+                visual_layers=[{
+                    "kind":"Layer","id":"n:timeline-background-layer",
+                    "zIndex":-2147483648,
+                    "start":{"num":0,"den":1},
+                    "duration":scene["duration"],"enabled":True,
+                    "blendMode":"normal","opacity":"1",
+                    "content":timeline_content,
+                    "masks":[],"effects":[],"annotations":{},
+                },*visual_layers]
             first=visual_layers[0]["content"]
             if first["kind"]!="Video":
                 raise Diagnostic("VDLS-BACKEND-003",
@@ -2037,6 +2975,12 @@ def ffmpeg_plans(ast: dict[str,Any], source: Path,
 
         for layer in visual_layers[1:]:
             content=layer["content"]
+            node_key=_random_node_key(str(content["id"]))
+            expression_variables={
+                "r":frame_random_ffexpr(seed,node_key,0,0),
+                "__random_seed":str(seed),
+                "__random_node":str(node_key),
+            }
             if content["kind"]=="Video":
                 asset=assets[content["assetRef"]]
                 asset_source=asset["source"]
@@ -2144,8 +3088,16 @@ def ffmpeg_plans(ast: dict[str,Any], source: Path,
                     base_blend=f"[b{label_index:04d}]"; label_index+=1
                     layer_blend=f"[l{label_index:04d}]"; label_index+=1
                     layer_alpha=f"[l{label_index:04d}]"; label_index+=1
+                    base_linear=f"[b{label_index:04d}]"; label_index+=1
+                    layer_linear=f"[l{label_index:04d}]"; label_index+=1
+                    blended_linear=f"[m{label_index:04d}]"; label_index+=1
                     blended=f"[m{label_index:04d}]"; label_index+=1
                     mask=f"[k{label_index:04d}]"; label_index+=1
+                    straight=f"[v{label_index:04d}]"; label_index+=1
+                    colour=f"[v{label_index:04d}]"; label_index+=1
+                    alpha_source=f"[v{label_index:04d}]"; label_index+=1
+                    alpha_plane=f"[k{label_index:04d}]"; label_index+=1
+                    premultiplied=f"[v{label_index:04d}]"; label_index+=1
                     filters.append(
                         f"color=c=black@0:s={width}x{height}:r={fps}:"
                         f"d={duration},"
@@ -2160,16 +3112,38 @@ def ffmpeg_plans(ast: dict[str,Any], source: Path,
                     filters.append(
                         f"{placed_label}split=2{layer_blend}{layer_alpha}")
                     filters.append(
-                        f"{base_blend}{layer_blend}"
+                        f"{base_blend}{linear_light_lut(encode=False)}"
+                        f"{base_linear}")
+                    filters.append(
+                        f"{layer_blend}{linear_light_lut(encode=False)}"
+                        f"{layer_linear}")
+                    filters.append(
+                        f"{base_linear}{layer_linear}"
                         f"blend=all_mode={ffmpeg_blend_mode(blend)}:"
                         f"all_opacity={opacity}:"
-                        f"enable='between(t,{start},{end})'{blended}")
+                        f"enable='between(t,{start},{end})'{blended_linear}")
+                    filters.append(
+                        f"{blended_linear}{linear_light_lut(encode=True)}"
+                        f"{blended}")
                     filters.append(
                         f"{layer_alpha}format=rgba,alphaextract,"
                         f"lut=y='val*{opacity}',format=rgba{mask}")
                     filters.append(
                         f"{base_keep}{blended}{mask}"
-                        f"maskedmerge=planes=7,format=rgba"
+                        f"maskedmerge=planes=7,format=rgba{straight}")
+                    # Keep the internal hand-off canonical: blend surfaces are
+                    # straight-alpha at the API boundary, then explicitly
+                    # normalized through premultiplied alpha before continuing.
+                    filters.append(
+                        f"{straight}split=2{colour}{alpha_source}")
+                    filters.append(
+                        f"{alpha_source}alphaextract{alpha_plane}")
+                    filters.append(
+                        f"{colour}{alpha_plane}premultiply=planes=7"
+                        f"{premultiplied}")
+                    filters.append(
+                        f"{premultiplied}{alpha_plane}"
+                        f"unpremultiply=planes=7,format=rgba"
                         f"{output_label}")
                 else:
                     raise Diagnostic(
@@ -2178,18 +3152,40 @@ def ffmpeg_plans(ast: dict[str,Any], source: Path,
                 current=output_label
                 continue
             if content["kind"]=="Subtitles":
-                asset_source=assets[content["assetRef"]]["source"]
-                if asset_source["kind"]!="File":
-                    raise Diagnostic("VDLS-BACKEND-003",
-                                     "FFmpeg subtitles require a file asset")
-                subtitle_path=(source.parent/asset_source["path"]).resolve()
-                if not subtitle_path.exists():
-                    raise Diagnostic("VDLS-ASSET-001",
-                                     f"subtitle asset not found: {asset_source['path']}")
+                karaoke=any(
+                    cue["payload"]["kind"]=="Karaoke"
+                    for cue in content["track"]["cues"])
+                normalized_subtitles=(
+                    serialize_karaoke_ass(content["track"]["cues"])
+                    if karaoke else
+                    serialize_sidecar(content["track"]["cues"],"srt"))
+                subtitle_digest=hashlib.sha256(
+                    normalized_subtitles.encode("utf-8")).hexdigest()
+                subtitle_dir=(
+                    Path(output_dir).resolve() if output_dir
+                    else source.parent)/".vdls-text"
+                subtitle_dir.mkdir(parents=True,exist_ok=True)
+                subtitle_path=(
+                    subtitle_dir/f"{subtitle_digest}.timeline."
+                    f"{'ass' if karaoke else 'srt'}")
+                if (not subtitle_path.exists()
+                        or subtitle_path.read_text(
+                            encoding="utf-8")!=normalized_subtitles):
+                    subtitle_path.write_text(
+                        normalized_subtitles,encoding="utf-8",newline="\n")
                 output_label=f"[v{label_index:04d}]"; label_index+=1
                 escaped_path=_ffmpeg_escape_filter_path(subtitle_path)
-                filters.append(
-                    f"{current}subtitles=filename='{escaped_path}'{output_label}")
+                # The normalized cues already use project-global timestamps.
+                # FFmpeg's subtitles filter has no timeline/enable support.
+                if karaoke:
+                    filters.append(
+                        f"{current}ass=filename='{escaped_path}':"
+                        "alpha=1:shaping=complex"
+                        f"{output_label}")
+                else:
+                    filters.append(
+                        f"{current}subtitles=filename='{escaped_path}':"
+                        f"alpha=1{output_label}")
                 current=output_label
                 continue
             if content["kind"]!="Text":
@@ -2383,7 +3379,8 @@ def ffmpeg_plans(ast: dict[str,Any], source: Path,
                 "-f","lavfi","-i",
                 f"color=c=black@0.0:"
                 f"s={text_layout.frame_width}x{text_layout.frame_height}:"
-                f"r={fps}:d={duration},format=rgba",
+                f"r={fps}:d={duration},format=rgba,"
+                "colorchannelmixer=aa=0",
             ])
             surface_label=f"[s{label_index:04d}]"; label_index+=1
             surface_filters=[ffmpeg_ass_filter(surface)]
@@ -2557,6 +3554,16 @@ def ffmpeg_plans(ast: dict[str,Any], source: Path,
                 if output_dir else (source.parent/output["path"]).resolve())
         temporary=target.with_name(f".{target.stem}.vdls-tmp{target.suffix}")
         script=target.with_name(f".{target.stem}.vdls-filter.txt")
+        chapter_text=serialize_timeline_chapters(
+            scene.get("markers",[]),scene["duration"])
+        chapter_path=(
+            target.with_name(f".{target.stem}.vdls-chapters.ffmeta")
+            if chapter_text else None)
+        chapter_input=None
+        if chapter_path is not None:
+            chapter_input=input_index
+            argv.extend(["-f","ffmetadata","-i",str(chapter_path)])
+            input_index+=1
         argv.extend(["-filter_complex_script",str(script)])
         if video:
             argv.extend(["-map","[vout]","-c:v","libx264","-pix_fmt","yuv420p",
@@ -2581,6 +3588,8 @@ def ffmpeg_plans(ast: dict[str,Any], source: Path,
             if reproducible: argv.extend(["-flags:a","+bitexact"])
         else:
             argv.append("-an")
+        if chapter_input is not None:
+            argv.extend(["-map_chapters",str(chapter_input)])
         if reproducible:
             argv.extend([
                 "-map_metadata","-1",
@@ -2631,6 +3640,8 @@ def ffmpeg_plans(ast: dict[str,Any], source: Path,
                     r"(?:^|,)([a-z][a-z0-9_]*)(?==|,|$)",argv[index+1]))
         plans.append({"targetId":output["outputId"],"argv":argv,
                       "filterScript":filter_script,"filterScriptPath":str(script),
+                      "chapterText":chapter_text,
+                      "chapterPath":str(chapter_path) if chapter_path else None,
                       "temporaryPath":str(temporary),"outputPath":str(target),
                       "cacheKey":"sha256:"+cache_key,
                       "reproducible":reproducible,
@@ -2644,6 +3655,7 @@ def ffmpeg_plans(ast: dict[str,Any], source: Path,
                       "expected":{
                           "video":video,"audio":audio,
                           "duration":scene["duration"],
+                          "markers":scene.get("markers",[]),
                           "color":(
                               ast["node"]["colorManagement"]["output"]
                               if video else None),
@@ -2775,6 +3787,8 @@ def execute_ffmpeg_plans(plans: list[dict[str,Any]],
     for plan in plans:
         target=Path(plan["outputPath"]); temporary=Path(plan["temporaryPath"])
         script=Path(plan["filterScriptPath"])
+        chapter=(Path(plan["chapterPath"])
+                 if plan.get("chapterPath") else None)
         target.parent.mkdir(parents=True,exist_ok=True)
         prepared_sidecars=_prepare_sidecars(plan)
         key=plan["cacheKey"].split(":",1)[1]
@@ -2790,8 +3804,15 @@ def execute_ffmpeg_plans(plans: list[dict[str,Any]],
                 if metadata.get("sha256")!="sha256:"+digest:
                     raise Diagnostic("VDLS-CACHE-002","cache object digest mismatch")
                 shutil.copyfile(cache_object,temporary)
+                try:
+                    validate_artifact(
+                        temporary,metadata["media"],plan["expected"],Diagnostic)
+                except BaseException:
+                    temporary.unlink(missing_ok=True)
+                    for item,_,_ in prepared_sidecars:
+                        item.unlink(missing_ok=True)
+                    raise
                 os.replace(temporary,target)
-                validate_artifact(target,metadata["media"],plan["expected"],Diagnostic)
                 artifacts.append({"id":plan["targetId"],"path":str(target),
                                   "sha256":metadata["sha256"],
                                   "media":metadata["media"],
@@ -2801,15 +3822,21 @@ def execute_ffmpeg_plans(plans: list[dict[str,Any]],
                 continue
         cache_misses+=1
         script.write_text(plan["filterScript"],encoding="utf-8")
+        if chapter is not None:
+            chapter.write_text(
+                plan["chapterText"],encoding="utf-8",newline="\n")
         try:
             completed=run_external(plan["argv"])
         except (ProcessInterrupted,ProcessTimedOut):
             temporary.unlink(missing_ok=True)
             script.unlink(missing_ok=True)
+            if chapter is not None: chapter.unlink(missing_ok=True)
             for item,_,_ in prepared_sidecars: item.unlink(missing_ok=True)
             raise
         if completed.returncode:
             excerpt=completed.stderr[-4000:]
+            script.unlink(missing_ok=True)
+            if chapter is not None: chapter.unlink(missing_ok=True)
             for item,_,_ in prepared_sidecars: item.unlink(missing_ok=True)
             raise Diagnostic("VDLS-FFMPEG-006",
                              f"FFmpeg failed for target `{plan['targetId']}`",
@@ -2818,21 +3845,34 @@ def execute_ffmpeg_plans(plans: list[dict[str,Any]],
             inspected=run_external(
                 [probe,"-v","error","-show_entries",
                  "format=duration:stream=codec_type,width,height,r_frame_rate,"
-                 "color_space,color_transfer,color_primaries,color_range",
+                 "color_space,color_transfer,color_primaries,color_range:"
+                 "chapter=id,time_base,start,end,start_time,end_time:"
+                 "chapter_tags=title",
                  "-of","json",str(temporary)],timeout=30)
         except (ProcessInterrupted,ProcessTimedOut):
             temporary.unlink(missing_ok=True)
             script.unlink(missing_ok=True)
+            if chapter is not None: chapter.unlink(missing_ok=True)
             for item,_,_ in prepared_sidecars: item.unlink(missing_ok=True)
             raise
         if inspected.returncode:
             temporary.unlink(missing_ok=True)
             script.unlink(missing_ok=True)
+            if chapter is not None: chapter.unlink(missing_ok=True)
             for item,_,_ in prepared_sidecars: item.unlink(missing_ok=True)
             raise Diagnostic("VDLS-FFMPEG-011",
                              f"FFprobe failed for target `{plan['targetId']}`")
         media=json.loads(inspected.stdout)
-        validate_artifact(temporary,media,plan["expected"],Diagnostic)
+        try:
+            validate_artifact(
+                temporary,media,plan["expected"],Diagnostic)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            script.unlink(missing_ok=True)
+            if chapter is not None: chapter.unlink(missing_ok=True)
+            for item,_,_ in prepared_sidecars:
+                item.unlink(missing_ok=True)
+            raise
         os.replace(temporary,target)
         digest=hashlib.sha256(target.read_bytes()).hexdigest()
         artifacts.append({"id":plan["targetId"],"path":str(target),
@@ -2855,6 +3895,7 @@ def execute_ffmpeg_plans(plans: list[dict[str,Any]],
             }),encoding="utf-8")
             os.replace(metadata_temp,cache_metadata)
         script.unlink(missing_ok=True)
+        if chapter is not None: chapter.unlink(missing_ok=True)
     return artifacts,cache_hits,cache_misses
 
 def inspect_media(path: Path) -> dict[str,Any]:

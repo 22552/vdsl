@@ -7,9 +7,11 @@ complex HarfBuzz-compatible shaper and rasterizer.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from functools import lru_cache
 import hashlib, json, math, unicodedata
 from pathlib import Path
 from fractions import Fraction
+import struct
 import regex
 from PIL import ImageFont, features
 
@@ -64,6 +66,31 @@ class TextRequest:
 
 
 @dataclass(frozen=True)
+class ShapedGlyph:
+    """A renderer-independent glyph placement in design-space pixels.
+
+    ``cluster`` is a half-open Unicode-string offset range.  Keeping this
+    boundary explicit lets a future native HarfBuzz adapter substitute or
+    position glyphs without changing the AST/TextLayout contract.
+    """
+    glyph_id: int
+    cluster: tuple[int,int]
+    advance_x: float
+    advance_y: float = 0.0
+    offset_x: float = 0.0
+    offset_y: float = 0.0
+
+
+@dataclass(frozen=True)
+class ShapedRun:
+    text: str
+    language: str
+    direction: str
+    font_file: str
+    glyphs: tuple[ShapedGlyph,...]
+
+
+@dataclass(frozen=True)
 class TextLayout:
     normalized_text: str
     lines: tuple[str, ...]
@@ -88,6 +115,7 @@ class TextLayout:
     max_lines: int | None
     line_height: float
     timeline_start: tuple[int,int]
+    shaped_runs: tuple[ShapedRun,...]
     digest: str
 
 
@@ -188,6 +216,123 @@ def _arrange(request: TextRequest, size: float) -> tuple[list[str],Any]:
     return lines,font
 
 
+@lru_cache(maxsize=32)
+def _ttf_metrics(font_file: str) -> tuple[dict[int,int], tuple[int,...], int]:
+    """Read the small SFNT subset required for deterministic fallback runs.
+
+    The reference profile intentionally has no Python HarfBuzz dependency.
+    This parser exposes the font's real cmap glyph IDs and hmtx advances; the
+    libass surface remains the complex-script renderer.  Unsupported font
+    containers fail closed instead of silently inventing glyph identifiers.
+    """
+    data=Path(font_file).read_bytes()
+    sfnt_start=0
+    if data[:4]==b"ttcf" and len(data)>=16:
+        face_count=struct.unpack_from(">I",data,8)[0]
+        if face_count:
+            sfnt_start=struct.unpack_from(">I",data,12)[0]
+    if (sfnt_start+12>len(data) or data[sfnt_start:sfnt_start+4] not in {
+            b"\x00\x01\x00\x00",b"OTTO",b"true",b"typ1"}):
+        raise TextEngineError("VDLS-TEXT-007","unsupported font container")
+    tables={}
+    count=struct.unpack_from(">H",data,sfnt_start+4)[0]
+    for index in range(count):
+        offset=sfnt_start+12+index*16
+        if offset+16>len(data): break
+        tag,_,table_offset,length=struct.unpack_from(">4sIII",data,offset)
+        if table_offset+length<=len(data):
+            tables[tag]=(table_offset,length)
+    try:
+        cmap_offset,_=tables[b"cmap"]
+        head_offset,_=tables[b"head"]
+        hhea_offset,_=tables[b"hhea"]
+        hmtx_offset,_=tables[b"hmtx"]
+    except KeyError as error:
+        raise TextEngineError("VDLS-TEXT-007","font lacks required SFNT table") from error
+    units=struct.unpack_from(">H",data,head_offset+18)[0]
+    metric_count=struct.unpack_from(">H",data,hhea_offset+34)[0]
+    advances=tuple(
+        struct.unpack_from(">H",data,hmtx_offset+index*4)[0]
+        for index in range(metric_count)
+        if hmtx_offset+index*4+4<=len(data))
+    cmap={}
+    encoding_count=struct.unpack_from(">H",data,cmap_offset+2)[0]
+    candidates=[]
+    for index in range(encoding_count):
+        offset=cmap_offset+4+index*8
+        if offset+8>len(data): continue
+        platform,encoding,sub_offset=struct.unpack_from(">HHI",data,offset)
+        absolute=cmap_offset+sub_offset
+        if absolute+2<=len(data):
+            candidates.append((0 if (platform,encoding)==(3,10) else
+                               1 if platform==3 else 2,absolute))
+    if not candidates:
+        raise TextEngineError("VDLS-TEXT-007","font lacks a Unicode cmap")
+    _,cmap_start=min(candidates)
+    format_code=struct.unpack_from(">H",data,cmap_start)[0]
+    if format_code==12:
+        groups=struct.unpack_from(">I",data,cmap_start+12)[0]
+        for index in range(groups):
+            offset=cmap_start+16+index*12
+            if offset+12>len(data): break
+            first,last,glyph=struct.unpack_from(">III",data,offset)
+            for codepoint in range(first,last+1):
+                cmap[codepoint]=glyph+codepoint-first
+    elif format_code==4:
+        seg_count=struct.unpack_from(">H",data,cmap_start+6)[0]//2
+        end_start=cmap_start+14
+        start_start=end_start+2*seg_count+2
+        delta_start=start_start+2*seg_count
+        range_start=delta_start+2*seg_count
+        for index in range(seg_count):
+            end=struct.unpack_from(">H",data,end_start+2*index)[0]
+            start=struct.unpack_from(">H",data,start_start+2*index)[0]
+            delta=struct.unpack_from(">h",data,delta_start+2*index)[0]
+            range_offset=struct.unpack_from(">H",data,range_start+2*index)[0]
+            for codepoint in range(start,end+1):
+                if range_offset:
+                    glyph_offset=range_start+2*index+range_offset+2*(codepoint-start)
+                    glyph=(struct.unpack_from(">H",data,glyph_offset)[0]
+                           if glyph_offset+2<=len(data) else 0)
+                    if glyph: glyph=(glyph+delta)&0xffff
+                else:
+                    glyph=(codepoint+delta)&0xffff
+                cmap[codepoint]=glyph
+    else:
+        raise TextEngineError("VDLS-TEXT-007",f"unsupported cmap format {format_code}")
+    return cmap,advances,units
+
+
+def shape_text_runs(text: str, font: FontRequest, language: str,
+                    direction: str) -> tuple[ShapedRun,...]:
+    """Expose stable shaped-run data before the libass rasterization adapter.
+
+    Runs are split on explicit line breaks.  Each glyph carries its source
+    cluster, real cmap glyph ID, and scaled font advance.  RAQM/libass remains
+    authoritative for contextual substitutions until an optional native
+    HarfBuzz adapter is installed.
+    """
+    cmap,advances,units=_ttf_metrics(font.file)
+    runs=[]; offset=0
+    for line in text.split("\n"):
+        glyphs=[]
+        for index,character in enumerate(line):
+            glyph_id=cmap.get(ord(character),0)
+            advance=(advances[min(glyph_id,len(advances)-1)] if advances
+                     else 0)
+            # Combining marks attach to the prior cluster in the fallback.
+            cluster_start=offset+index
+            if unicodedata.combining(character) and glyphs:
+                cluster_start=glyphs[-1].cluster[0]
+                advance=0
+            glyphs.append(ShapedGlyph(
+                glyph_id,(cluster_start,offset+index+1),
+                advance*font.size/max(1,units)))
+        runs.append(ShapedRun(line,language,direction,font.file,tuple(glyphs)))
+        offset+=len(line)+1
+    return tuple(runs)
+
+
 def layout_text(request: TextRequest) -> TextLayout:
     if request.normalization not in {"preserve", "nfc", "nfkc"}:
         raise TextEngineError(
@@ -252,6 +397,8 @@ def layout_text(request: TextRequest) -> TextLayout:
         lines[-1]=_ellipsis(lines[-1],font,request.frame_width)
     effective_font=replace(request.font,size=effective_size)
     text="\n".join(lines)
+    shaped_runs=shape_text_runs(
+        text,effective_font,request.language,request.direction)
     horizontal={
         "top-left":0.0,"left":0.0,"bottom-left":0.0,
         "top":0.5,"center":0.5,"bottom":0.5,
@@ -314,6 +461,13 @@ def layout_text(request: TextRequest) -> TextLayout:
         "maxLines":request.max_lines,
         "lineHeight":request.line_height,
         "timelineStart":request.timeline_start,
+        "shapedRuns":[{
+            "text":run.text,
+            "language":run.language,
+            "direction":run.direction,
+            "fontFile":run.font_file,
+            "glyphs":[asdict(glyph) for glyph in run.glyphs],
+        } for run in shaped_runs],
     }
     digest=hashlib.sha256(json.dumps(
         payload,ensure_ascii=False,sort_keys=True,separators=(",",":")
@@ -326,7 +480,7 @@ def layout_text(request: TextRequest) -> TextLayout:
         request.reveal_lines_duration,request.fade_in_duration,
         request.word_highlights,request.wrap_mode,request.overflow,
         request.max_lines,request.line_height,
-        request.timeline_start,f"sha256:{digest}",
+        request.timeline_start,shaped_runs,f"sha256:{digest}",
     )
 
 

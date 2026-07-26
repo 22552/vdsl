@@ -160,3 +160,25 @@ def validate_artifact(
         raise diagnostic(
             "VDLS-FFMPEG-012",
             f"rendered duration {actual_duration} does not match {wanted_duration}")
+    expected_markers=expected.get("markers",[])
+    chapters=probe_data.get("chapters",[])
+    if len(chapters)!=len(expected_markers):
+        raise diagnostic(
+            "VDLS-FFMPEG-012",
+            f"rendered chapter count {len(chapters)} does not match "
+            f"{len(expected_markers)}")
+    for chapter,marker in zip(chapters,expected_markers):
+        actual_start=Fraction(str(chapter.get("start_time","0")))
+        wanted_start=Fraction(marker["time"]["num"],marker["time"]["den"])
+        if abs(actual_start-wanted_start)>Fraction(1,1000):
+            raise diagnostic(
+                "VDLS-FFMPEG-012",
+                f"rendered chapter start {actual_start} does not match "
+                f"{wanted_start}")
+        actual_title=str(chapter.get("tags",{}).get("title",""))
+        wanted_title=str(marker.get("label") or marker["markerId"])
+        if actual_title!=wanted_title:
+            raise diagnostic(
+                "VDLS-FFMPEG-012",
+                f"rendered chapter title `{actual_title}` does not match "
+                f"`{wanted_title}`")

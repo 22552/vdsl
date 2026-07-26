@@ -46,6 +46,9 @@ Project discovery follows `vdls.toml`, `project.vdsl`, then `main.vdsl`.
 - file, URL, generated, and plugin asset-source AST forms
 - trim, timing, transforms, opacity, blend mode, filters, and animations in AST
 - typed and defaulted template expansion before Semantic AST construction
+- the 001/011 finite Lisp layer: lexical `define`/`lambda`/`let`, conditions,
+  immutable lists and higher-order functions, bounded `for` expansion, typed
+  components/slots, and namespaced modules
 - explicit relative imports with cycle detection and project-root isolation
 - JSON locale catalogs, fallback chains, and `(tr "...")` expansion before AST
 - SRT/WebVTT parsing into exact half-open cues and subtitle burn-in
@@ -54,6 +57,8 @@ Project discovery follows `vdls.toml`, `project.vdsl`, then `main.vdsl`.
 - pure expression validation and FFmpeg expression lowering
 - `r`, a deterministic per-frame pseudo-random scalar in `[0,1)` derived from
   `frame` and `(build-options (seed ...))`
+- traversal-independent `random`/`random2`/`random3`/`random4` streams keyed by
+  project seed, node ID, frame, stream, salt, and vector component
 - stable JSON diagnostics and canonical JSON serialization
 - content-addressed render cache with digest verification, status, prune, and clean
 - Plugin ABI 1 manifest, capability, permission, entry-path, and lock validation
@@ -76,6 +81,8 @@ The FFmpeg backend currently renders:
 - audio gain, EQ, high/low-pass, dynamics, loudness normalization,
   resampling, mixing, H.264/AAC encoding, and muxing
 - timeline-aware sidechain ducking with explicit attack/release
+- a project-global timeline for sequential/absolute scene placement, global
+  BGM, subtitles, watermarks, and marker-to-container chapter lowering
 - sharp foreground text with independently blurred two-layer shadows
 - deterministic word/grapheme/balanced wrapping and
   visible/clip/ellipsis/shrink text-box overflow
@@ -90,6 +97,8 @@ The FFmpeg backend currently renders:
 - deterministic SRT/WebVTT sidecar export with independent manifest artifacts
 - normalized EXIF inspection and privacy-reduced EXIF provenance summaries
 - grapheme-safe typewriter, line reveal, word highlight, and text fade helpers
+- cubic-Bézier and physical spring easing for scalar animations
+- inline karaoke subtitle cues lowered to ASS while retaining portable SRT/VTT sidecars
 - text-box word wrapping and clipping on independent RGBA surfaces
 - multi-video overlay, transform, opacity, multiply/screen blend, and timed placement
 - video/audio speed and fade helpers plus ordered crop/pad/tone filters
@@ -115,9 +124,10 @@ Per-frame random motion:
     (position (* r 580) 140)))
 ```
 
-For a fixed seed, `r` is identical everywhere within one frame and changes on
-the next frame. Rebuilding the same source with the same seed reproduces the
-same sequence.
+For a fixed seed and node, `r` is stable within one frame and changes on the
+next frame. Independent nodes and explicit random streams do not share mutable
+generator state. Rebuilding the same source with the same seed reproduces the
+same sequences.
 
 ## Tests
 

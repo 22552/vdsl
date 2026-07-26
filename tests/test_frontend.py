@@ -74,6 +74,163 @@ class FrontendTests(unittest.TestCase):
                             for edge in value["edges"]))
         vdls.validate_graph(value)
 
+    def test_project_timeline_is_explicit_and_legacy_compatible(self):
+        legacy=vdls.compile_source(
+            EXAMPLE.read_text(encoding="utf-8"),EXAMPLE)
+        self.assertFalse(legacy["node"]["timeline"]["explicit"])
+        self.assertEqual(
+            legacy["node"]["timeline"]["items"][0]["start"],
+            {"num":0,"den":1})
+        source=Path("examples/global-timeline.vdsl")
+        ast=vdls.compile_source(source.read_text(encoding="utf-8"),source)
+        timeline=ast["node"]["timeline"]
+        self.assertTrue(timeline["explicit"])
+        self.assertEqual(timeline["duration"],{"num":4,"den":1})
+        self.assertEqual(
+            [item["kind"] for item in timeline["items"]],
+            ["ScenePlacement","ScenePlacement","GlobalLayer","GlobalLayer",
+             "GlobalLayer"])
+        value=vdls.graph(ast)
+        timeline_nodes=[
+            node for node in value["nodes"]
+            if node["kind"]=="core/project-timeline"]
+        self.assertEqual(len(timeline_nodes),1)
+        self.assertEqual(len(timeline_nodes[0]["params"]["markers"]),2)
+        self.assertIn(
+            ("metadata","timeline-metadata"),
+            {(port["name"],port["mediaType"])
+             for port in timeline_nodes[0]["outputs"]})
+        mux=next(node for node in value["nodes"]
+                 if node["kind"]=="core/mux")
+        self.assertIn(
+            ("chapters","timeline-metadata"),
+            {(port["name"],port["mediaType"]) for port in mux["inputs"]})
+        self.assertTrue(any(
+            target["outputSpec"].get("kind")=="subtitle-sidecar"
+            for target in value["targets"]))
+        vdls.validate_graph(value)
+        plan=vdls.ffmpeg_plans(ast,source)[0]
+        self.assertIn("-map_chapters",plan["argv"])
+        self.assertIn("title=Opening",plan["chapterText"])
+        flattened,_=vdls.output_timeline_scene(
+            ast,ast["node"]["outputs"][0])
+        subtitle=next(
+            layer for layer in flattened["layers"]
+            if layer["content"]["kind"]=="Subtitles")
+        self.assertEqual(
+            subtitle["content"]["track"]["cues"][0]["start"],
+            {"num":1,"den":1})
+
+    def test_stack_and_grid_are_canonical_then_target_resolved(self):
+        source=Path("examples/layout-stack-grid.vdsl")
+        ast=vdls.compile_source(
+            source.read_text(encoding="utf-8"),source)
+        layout=ast["node"]["scenes"][0]["layers"][1]["content"]
+        self.assertEqual(layout["kind"],"LayoutGroup")
+        self.assertEqual(layout["layoutKind"],"grid")
+        self.assertEqual(layout["columns"],2)
+        value=vdls.graph(ast)
+        kinds={node["kind"] for node in value["nodes"]}
+        self.assertIn("core/layout-grid",kinds)
+        self.assertIn("core/layout-stack",kinds)
+        resolved=vdls.resolve_layout_layers(
+            ast["node"]["scenes"][0]["layers"],640,360)
+        text_layers=[
+            layer for layer in resolved
+            if layer["content"]["kind"]=="Text"]
+        self.assertEqual(len(text_layers),5)
+        rectangles=[
+            layer["content"]["annotations"]["vdls.layoutRect"]
+            for layer in text_layers]
+        self.assertEqual(rectangles[0]["x"],{"num":24,"den":1})
+        self.assertNotEqual(rectangles[0],rectangles[1])
+        plan=vdls.ffmpeg_plans(ast,source)[0]
+        self.assertNotIn("layout-",plan["filterScript"])
+
+    def test_lisp_core_expands_functions_lists_for_and_component(self):
+        source=Path("examples/lisp-core.vdsl")
+        ast=vdls.compile_source(
+            source.read_text(encoding="utf-8"),source)
+        scene=ast["node"]["scenes"][0]
+        self.assertEqual(len(scene["layers"]),6)
+        labels=[
+            layer["content"]["content"]["value"]
+            for layer in scene["layers"]
+            if layer["content"]["kind"]=="Text"]
+        self.assertEqual(
+            labels,["LAMBDA","LET","FOR","sum-of-squares=14",
+                    "NAMESPACED MODULE"])
+        positions=[
+            layer["content"]["layout"]["position"][0]
+            for layer in scene["layers"][1:4]]
+        self.assertEqual(positions,["24px","224px","424px"])
+        identity=ast["node"]["annotations"]["vdls.lispExpansion"]
+        self.assertEqual(
+            [name for name in identity["definitions"]
+             if not name.startswith("__module_")],
+            ["margin","squares","total","x-position"])
+        self.assertEqual(
+            identity["components"],["label","ui:module-label"])
+        plan=vdls.ffmpeg_plans(ast,source)[0]
+        transparent_inputs=[
+            value for value in plan["argv"]
+            if isinstance(value,str)
+            and "color=c=black@0.0" in value]
+        self.assertEqual(len(transparent_inputs),5)
+        self.assertTrue(all(
+            "colorchannelmixer=aa=0" in value
+            for value in transparent_inputs))
+
+    def test_lisp_parallel_lengths_and_dimension_errors_are_stable(self):
+        with self.assertRaisesRegex(vdls.Diagnostic,"VDLS-LISP-021"):
+            self.compile_text(
+                '#lang vdls\n'
+                '(define bad (map (lambda (x y) (+ x y)) '
+                '(range 2) (range 3)))\n'
+                '(project (id "x"))')
+        with self.assertRaisesRegex(vdls.Diagnostic,"VDLS-TYPE-004"):
+            self.compile_text(
+                '#lang vdls\n'
+                '(define bad (+ 1s 2px))\n'
+                '(project (id "x"))')
+        with self.assertRaisesRegex(vdls.Diagnostic,"VDLS-LISP-002"):
+            self.compile_text(
+                '#lang vdls\n'
+                '(component badge ([x : Length]) (text "x" (position x 0px)))'
+                '(project (id "x") (scene s (duration 1s) '
+                '(layer 0 (badge (x "wrong")))))')
+
+    def test_typed_component_slot_expands_before_ast(self):
+        ast=self.compile_text(
+            '#lang vdls\n'
+            '(component card ([title : String]) '
+            '(slot body : NodeList<Visual>) '
+            '(group (text title) (slot-ref body))) '
+            '(project (id "slot") '
+            '(scene s (duration 1s) '
+            '(layer 0 (card (title "Card") '
+            '(body (text "A") (text "B"))))))')
+        group=ast["node"]["scenes"][0]["layers"][0]["content"]
+        self.assertEqual(group["kind"],"Group")
+        self.assertEqual(
+            [child["content"]["value"] for child in group["children"]],
+            ["Card","A","B"])
+        typed=self.compile_text(
+            '#lang vdls\n'
+            '(define result '
+            '((lambda ([x : Number] [y : Number]) : Number (+ x y)) 2 3)) '
+            '(project (id "typed"))')
+        self.assertIn(
+            "result",
+            typed["node"]["annotations"]["vdls.lispExpansion"][
+                "definitions"])
+        with self.assertRaisesRegex(vdls.Diagnostic,"VDLS-LISP-002"):
+            self.compile_text(
+                '#lang vdls\n'
+                '(define bad '
+                '((lambda ([x : Length]) : Length x) 3)) '
+                '(project (id "typed"))')
+
     def test_color_management_is_explicit_and_lowered(self):
         ast=vdls.compile_source(
             COLOR_EXAMPLE.read_text(encoding="utf-8"),COLOR_EXAMPLE)
@@ -310,6 +467,37 @@ class FrontendTests(unittest.TestCase):
         self.assertIn("clip((t-0)/2,0,1)", expression)
         self.assertIn("400", expression)
 
+    def test_cubic_bezier_and_spring_are_normalized_and_lowered(self):
+        source=Path("examples/advanced-easing.vdsl")
+        ast=vdls.compile_source(source.read_text(encoding="utf-8"),source)
+        animations=[
+            layer["content"]["animations"][0]
+            for layer in ast["node"]["scenes"][0]["layers"][1:]]
+        self.assertEqual(animations[0]["easing"]["kind"],"CubicBezier")
+        self.assertEqual(animations[1]["easing"]["kind"],"Spring")
+        bezier=vdls.compile_animation_ffexpr(animations[0])
+        spring=vdls.compile_animation_ffexpr(animations[1])
+        self.assertIn("if(lt(",bezier)
+        self.assertIn("cos(",spring)
+        self.assertIn("exp(",spring)
+        with self.assertRaisesRegex(vdls.Diagnostic,"VDLS-TYPE-009"):
+            vdls.normalize_easing(["cubic-bezier","-0.1","0","0.5","1"])
+        with self.assertRaisesRegex(vdls.Diagnostic,"VDLS-TYPE-009"):
+            vdls.normalize_easing(["spring",["mass","0"]])
+
+    def test_inline_karaoke_cues_lower_to_ass_and_export_plain_sidecar(self):
+        source=Path("examples/karaoke.vdsl")
+        ast=vdls.compile_source(source.read_text(encoding="utf-8"),source)
+        subtitle=ast["node"]["scenes"][0]["layers"][1]["content"]
+        cue=subtitle["track"]["cues"][0]
+        self.assertEqual(cue["payload"]["kind"],"Karaoke")
+        self.assertEqual(len(cue["payload"]["segments"]),3)
+        plan=vdls.ffmpeg_plans(ast,source)[0]
+        self.assertIn("ass=filename=",plan["filterScript"])
+        self.assertEqual(
+            vdls.serialize_sidecar(subtitle["track"]["cues"],"srt"),
+            "1\n00:00:00,000 --> 00:00:02,000\nこんにちは\n")
+
     def test_r_is_a_deterministic_per_frame_random_variable(self):
         expression = vdls.compile_ffexpr(vdls.Symbol("r"))
         self.assertIn("n+0", expression)
@@ -317,6 +505,27 @@ class FrontendTests(unittest.TestCase):
         self.assertEqual(expression, vdls.compile_ffexpr(vdls.Symbol("r")))
         seeded = vdls.frame_random_ffexpr(2026)
         self.assertIn("n+2026", seeded)
+        variables={"__random_seed":"2026","__random_node":"99"}
+        first=vdls.compile_ffexpr(
+            [vdls.Symbol("random"),vdls.Symbol("3"),vdls.Symbol("7")],
+            variables)
+        self.assertEqual(
+            first,vdls.compile_ffexpr(
+                [vdls.Symbol("random"),vdls.Symbol("3"),vdls.Symbol("7")],
+                variables))
+        self.assertNotEqual(
+            first,vdls.compile_ffexpr(
+                [vdls.Symbol("random"),vdls.Symbol("4"),vdls.Symbol("7")],
+                variables))
+        component=vdls.compile_ffexpr([
+            vdls.Symbol("component"),
+            [vdls.Symbol("random3"),vdls.Symbol("3")],
+            vdls.Symbol("2")],variables)
+        self.assertNotEqual(first,component)
+        with self.assertRaisesRegex(vdls.Diagnostic,"VDLS-LISP-060"):
+            vdls.compile_ffexpr(
+                [vdls.Symbol("random"),vdls.Symbol("not-an-index")],
+                variables)
 
     def test_subtitles_are_normalized_to_half_open_cues(self):
         cues = vdls.parse_subtitles(
@@ -489,6 +698,9 @@ class FrontendTests(unittest.TestCase):
         self.assertIn("blend=all_mode=difference",script)
         self.assertIn("blend=all_mode=softlight",script)
         self.assertIn("maskedmerge",script)
+        self.assertIn("lutrgb=",script)
+        self.assertIn("premultiply=planes=7",script)
+        self.assertIn("unpremultiply=planes=7",script)
 
     def test_text_engine_is_independent_from_drawtext(self):
         ast=vdls.compile_source(EXAMPLE.read_text(encoding="utf-8"),EXAMPLE)
@@ -506,6 +718,19 @@ class FrontendTests(unittest.TestCase):
         self.assertEqual(preserved.normalized_text,decomposed)
         self.assertEqual(normalized.normalized_text,"Café")
         self.assertNotEqual(preserved.digest,normalized.digest)
+
+    def test_text_layout_exposes_font_glyph_runs_before_rasterization(self):
+        font=vdls._default_font_file("Glyph runs")
+        layout=layout_text(TextRequest(
+            "A\\u0301B",FontRequest(str(font),font.stem,32),Paint(),640,360,
+            normalization="nfc"))
+        self.assertEqual(len(layout.shaped_runs),1)
+        run=layout.shaped_runs[0]
+        self.assertEqual(len(run.glyphs),len(run.text))
+        self.assertEqual(run.glyphs[0].cluster,(0,1))
+        self.assertGreater(run.glyphs[0].glyph_id,0)
+        self.assertGreater(run.glyphs[0].advance_x,0)
+        self.assertEqual(layout.digest[:7],"sha256:")
 
     def test_typewriter_uses_extended_grapheme_clusters(self):
         text="A\u0301👨‍👩‍👧‍👦"
