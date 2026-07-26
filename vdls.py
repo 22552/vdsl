@@ -1693,6 +1693,24 @@ def graph(ast: dict[str,Any]) -> dict[str,Any]:
                 edges.append({"fromNode":color_node,"fromPort":"surface",
                               "toNode":encode,"toPort":"video"})
         if output["audio"]:
+            if not audio_terminal:
+                silence=f"rg:generate-silence:{output['id']}"
+                output_duration=(
+                    project_timeline["duration"]
+                    if project_timeline and project_timeline.get("explicit")
+                    else next(
+                        scene["duration"] for scene in ast["node"]["scenes"]
+                        if scene["sceneId"]==chosen))
+                add_node(
+                    silence,"core/generate-silence",[],
+                    [port("audio","audio-stream")],{
+                        "duration":output_duration,
+                        "sampleRate":output["audio"]["sampleRate"],
+                        "channelLayout":output["audio"]["channelLayout"],
+                    },{
+                        "start":{"num":0,"den":1},
+                        "duration":output_duration,"rate":None})
+                audio_terminal=(silence,"audio")
             resample=f"rg:resample-audio:{output['id']}"
             encode_audio=f"rg:encode-audio:{output['id']}"
             add_node(resample,"core/resample-audio",[port("audio","audio-stream")],
@@ -3534,7 +3552,17 @@ def ffmpeg_plans(ast: dict[str,Any], source: Path,
                     label_index,sample_rate)
                 audio_labels.append(label)
             if not audio_labels:
-                raise Diagnostic("VDLS-GRAPH-002","audio output has no audio layer")
+                channel_layout=audio.get("channelLayout","stereo")
+                argv.extend([
+                    "-f","lavfi","-i",
+                    f"anullsrc=r={sample_rate}:cl={channel_layout}:d={duration}"])
+                silence_label=f"[a{label_index:04d}]"; label_index+=1
+                filters.append(
+                    f"[{input_index}:a]atrim=duration={duration},"
+                    f"asetpts=PTS-STARTPTS,aresample={sample_rate}"
+                    f"{silence_label}")
+                input_index+=1
+                audio_labels.append(silence_label)
             if len(audio_labels)==1:
                 filters.append(f"{audio_labels[0]}anull[aout]")
             else:
