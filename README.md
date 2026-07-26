@@ -14,8 +14,20 @@ Implemented requirements and known gaps are tracked in
 
 - Python 3.11 or newer
 - FFmpeg and FFprobe on `PATH`
+- Pillow 10 or newer
+- `regex` 2024.5 or newer
 
-No third-party Python packages are required.
+Install the Python dependencies with:
+
+```powershell
+python -m pip install -e .
+```
+
+For offline installation, download or vendor compatible wheels for Pillow and
+`regex` in advance. The standalone compile-time Lisp evaluator in
+`vdls_lisp.py` does not require the text-engine dependencies, but importing the
+full `vdls.py` frontend loads the Text Engine and therefore requires both
+packages.
 
 ## Quick start
 
@@ -142,7 +154,7 @@ audio pipelines, and CLI diagnostics.
 ## Conformance status
 
 The implementation does not yet claim complete Draft 1.0 conformance.
-  Remaining work includes the complete animation evaluator, every
-  standard-library filter and generator, native glyph-run export beyond the
-  current libass raster adapter, stronger OS-level plugin sandboxing, full plugin dependency
-resolution, GPU lowering, and the remaining CLI lifecycle commands.
+Remaining work includes the complete animation evaluator, every
+standard-library filter and generator, native glyph-run export beyond the
+current libass raster adapter, stronger OS-level plugin sandboxing, full plugin
+dependency resolution, GPU lowering, and the remaining CLI lifecycle commands.
