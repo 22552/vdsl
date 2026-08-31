@@ -1,14 +1,13 @@
 # VDLS Reference Implementation
 
-This repository contains an executable reference implementation of the
-[VDLS Draft 1.0 specification](https://github.com/22552/docssss).
+VDLS is a deterministic, backend-neutral video description language. This repository
+contains the executable reference implementation for VDLS Draft 1.0, including a
+typed Render Graph frontend and an FFmpeg reference backend.
 
-The current implementation provides a backend-neutral semantic frontend,
-typed Render Graph lowering, and an FFmpeg reference backend. It is being
-developed toward full Draft 1.0 conformance; unsupported constructs fail with
-stable `VDLS-*` diagnostics rather than being silently approximated.
-Implemented requirements and known gaps are tracked in
-[CONFORMANCE.md](CONFORMANCE.md).
+Public implementation documentation lives in [`docs/`](docs/), while implemented
+requirements and known gaps are tracked in [`CONFORMANCE.md`](CONFORMANCE.md).
+Unsupported constructs fail with stable `VDLS-*` diagnostics rather than being
+silently approximated.
 
 ## Requirements
 
@@ -158,3 +157,7 @@ Remaining work includes the complete animation evaluator, every
 standard-library filter and generator, native glyph-run export beyond the
 current libass raster adapter, stronger OS-level plugin sandboxing, full plugin
 dependency resolution, GPU lowering, and the remaining CLI lifecycle commands.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
